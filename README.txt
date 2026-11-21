@@ -19,3 +19,6 @@ PENTING: kalau sebelumnya sudah pernah menjalankan versi lama, HAPUS file config
 supaya dibuat ulang dengan nilai baru.
 Kalau masih crash: set HookAnim=0, lalu HookHydra=0, lalu HookPlayer=0 satu per satu di .ini untuk
 mencari hook penyebabnya, dan kirim log "BulletTimeSA64" dari logcat.
+
+Diagnosa tombol hidrolik: mod menulis /sdcard/Android/data/com.rockstargames.gtasa/files/BulletTime_log.txt
+Jalan kaki ~10 detik, lalu naik kendaraan sebentar, lalu kirim isi file itu.

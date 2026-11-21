@@ -16,8 +16,9 @@
 #include <time.h>
 #include <stdio.h>
 #include <stdlib.h>
+#include <stdarg.h>
 
-MYMODCFGNAME(net.hafizdms.sabullettime, Bullet Time Dodge, 1.1, hafizdMS/zidanaSQ, BulletTime)
+MYMODCFGNAME(net.hafizdms.sabullettime, Bullet Time Dodge, 1.2, hafizdMS/zidanaSQ, BulletTime)
 NEEDGAME(com.rockstargames.gtasa)
 
 // ---------------------------------------------------------------- game symbols
@@ -29,6 +30,7 @@ typedef void   (*ApplyMoveForce_t)(void*, CVector);     // CVector lewat registe
 typedef void   (*PedProcess_t)(void*);
 typedef void   (*AnimUpdate_t)(void*, float, bool);
 typedef void   (*HydraUpdate_t)(void*);
+typedef void   (*HydraDraw_t)(void*);
 typedef bool   (*WidgetIsTouched_t)(void*, void*);      // virtual CWidget::IsTouched(CVector2D*) (vtable +160)
 typedef void*  (*GetAnimationBlock_t)(const char*);
 typedef void*  (*RegisterAnimBlock_t)(const char*);
@@ -45,6 +47,7 @@ static float*             pTimeStep = NULL;       // CTimer::ms_fTimeStep
 static PedProcess_t       PlayerProcess_orig = NULL;
 static AnimUpdate_t       AnimUpdate_orig = NULL;
 static HydraUpdate_t      HydraUpdate_orig = NULL;
+static HydraDraw_t        HydraDraw_orig = NULL;
 static GetAnimationBlock_t GetAnimationBlock = NULL;
 static RegisterAnimBlock_t RegisterAnimBlock = NULL;
 static LoadAnimFile_t     LoadAnimFile = NULL;
@@ -56,6 +59,7 @@ struct Settings
 {
     bool  enabled, debugPad, holdToActivate, autoBulletTime, hydraButton, hydraDodge, useIfp;
     bool  hookPlayer, hookAnim, hookHydra;
+    unsigned hydraFlagClear, hydraFlagSet;
     int   activateBtn, diveBtn, animFlags;
     float animBlend, cjSpeed, worldSpeed, blendIn, blendOut, duration, refill, startMeter, activationMin;
     float tapWindow, diveForward, diveUp, diveSlow;
@@ -99,6 +103,8 @@ static void LoadSettings()
     S.hookPlayer     = CB("HookPlayer", true, "Debug");
     S.hookAnim       = CB("HookAnim", true, "Debug");
     S.hookHydra      = CB("HookHydra", true, "Debug");
+    S.hydraFlagClear = (unsigned)CF("HydraFlagClear", 4.0f, "Debug");   // bit flag widget (+140) yang dihapus saat jalan kaki
+    S.hydraFlagSet   = (unsigned)CF("HydraFlagSet", 0.0f, "Debug");     // bit flag widget yang ditambahkan saat jalan kaki
 
     S.hydraButton    = CB("HydraulicsButtonOnFoot", true, "BulletTime");
     S.activateBtn    = CPadBtn("ActivateButton", "None", "BulletTime");
@@ -132,6 +138,17 @@ static void LoadSettings()
     if(S.blendIn  < 0.01f) S.blendIn  = 0.01f;
     if(S.blendOut < 0.01f) S.blendOut = 0.01f;
     if(S.duration < 1.0f)  S.duration = 1.0f;
+}
+
+// log ke file (mudah dikirim): <AndroidData>/BulletTime_log.txt
+static void FLog(const char* fmt, ...)
+{
+    char msg[300];
+    va_list ap; va_start(ap, fmt); vsnprintf(msg, sizeof(msg), fmt, ap); va_end(ap);
+    logger->Info("%s", msg);
+    char path[500]; snprintf(path, sizeof(path), "%s/BulletTime_log.txt", aml->GetAndroidDataPath());
+    FILE* f = fopen(path, "a");
+    if(f) { fprintf(f, "%s\n", msg); fclose(f); }
 }
 
 // ---------------------------------------------------------------- state
@@ -359,36 +376,62 @@ static void AnimUpdate_hook(void* clump, float dt, bool onScreen)
     AnimUpdate_orig(clump, dt, onScreen);
 }
 
-// Tombol hidrolik (CWidgetButtonHydraulics): +200 = aktif, +201 = tampil.
-// Update() bawaan mengosongkan keduanya saat tidak di kendaraan; di sini diaktifkan lagi saat berjalan kaki.
+// Tombol hidrolik (CWidgetButtonHydraulics): +200 = aktif, +201 = tampil, +140 = flag widget (bit2 = nonaktif).
+// Update() bawaan mengosongkan +200/+201 saat tidak di kendaraan; di sini diaktifkan lagi saat berjalan kaki.
+static int   gHUpdFoot = 0, gHDrawFoot = 0;
+static bool  gHVehLogged = false, gHSumLogged = false;
+static double gHFirstFoot = 0.0;
+static bool  gOnFootNow = false;
+
 static void HydraUpdate_hook(void* self)
 {
     HydraUpdate_orig(self);
     if(!S.enabled || !S.hydraButton || !FindPlayerPed) return;
+    uint8_t* w = (uint8_t*)self;
+    uint32_t* fl = (uint32_t*)(w + 140);
 
     void* ped = FindPlayerPed(0);
     if(!ped)
     {
-        // tidak ada pemain (loading/menu): pastikan bullet time mati
+        gOnFootNow = false;
         if(gScale < 0.999f && pTimeScale) { gScale = 1.0f; *pTimeScale = 1.0f; }
         gManual = false; gDiveSlow = 0.0f; gHydraPrev = false;
         return;
     }
-    if(FindPlayerVehicle && FindPlayerVehicle(0, false)) { gHydraPrev = false; return; }
+    if(FindPlayerVehicle && FindPlayerVehicle(0, false))
+    {
+        gOnFootNow = false; gHydraPrev = false;
+        if(!gHVehLogged) { gHVehLogged = true; FLog("Hydra di kendaraan: aktif=%d tampil=%d flag140=0x%x", (int)w[200], (int)w[201], *fl); }
+        return;
+    }
 
-    uint8_t* w = (uint8_t*)self;
+    gOnFootNow = true;
+    ++gHUpdFoot;
     if(!gHydraLogged)
     {
         gHydraLogged = true;
-        logger->Info("Hydra widget (jalan kaki): aktif=%d tampil=%d flag140=0x%x", (int)w[200], (int)w[201], *(uint32_t*)(w + 140));
+        gHFirstFoot = RealNow();
+        FLog("Hydra Update dipanggil saat jalan kaki. Sebelum: aktif=%d tampil=%d flag140=0x%x", (int)w[200], (int)w[201], *fl);
     }
+    *fl = (*fl & ~S.hydraFlagClear) | S.hydraFlagSet;
     w[200] = 1;
     w[201] = 1;
+    if(gHFirstFoot > 0.0 && !gHSumLogged && RealNow() - gHFirstFoot > 8.0)
+    {
+        gHSumLogged = true;
+        FLog("Ringkasan 8 detik jalan kaki: Update=%d Draw=%d flag140=0x%x (clear=0x%x set=0x%x)", gHUpdFoot, gHDrawFoot, *fl, S.hydraFlagClear, S.hydraFlagSet);
+    }
 
     void** vt = *(void***)self;
     bool touched = ((WidgetIsTouched_t)vt[20])(self, NULL);
     if(touched && !gHydraPrev) gHydraTap = true;
     gHydraPrev = touched;
+}
+
+static void HydraDraw_hook(void* self)
+{
+    if(gOnFootNow) ++gHDrawFoot;
+    HydraDraw_orig(self);
 }
 
 // ---------------------------------------------------------------- init
@@ -427,6 +470,7 @@ ON_MOD_LOAD()
     uintptr_t playerProcess = Sym(lib, "_ZN10CPlayerPed14ProcessControlEv");
     uintptr_t animUpdate    = Sym(lib, "_Z32RpAnimBlendClumpUpdateAnimationsP7RpClumpfb");
     uintptr_t hydraUpdate   = Sym(lib, "_ZN23CWidgetButtonHydraulics6UpdateEv");
+    uintptr_t hydraDraw     = Sym(lib, "_ZN23CWidgetButtonHydraulics4DrawEv");
 
     if(S.hookPlayer && playerProcess && pTimeScale && GetPad)
         aml->Hook((void*)playerProcess, (void*)PlayerProcess_hook, (void**)&PlayerProcess_orig);
@@ -436,9 +480,13 @@ ON_MOD_LOAD()
         aml->Hook((void*)animUpdate, (void*)AnimUpdate_hook, (void**)&AnimUpdate_orig);
 
     if(S.hookHydra && S.hydraButton && hydraUpdate)
+    {
         aml->Hook((void*)hydraUpdate, (void*)HydraUpdate_hook, (void**)&HydraUpdate_orig);
+        if(hydraDraw) aml->Hook((void*)hydraDraw, (void*)HydraDraw_hook, (void**)&HydraDraw_orig);
+    }
     else if(S.hydraButton) logger->Error("Tombol hidrolik di mode jalan TIDAK dipasang");
 
+    FLog("=== BulletTimeSA64 v1.2 dimulai ===");
     logger->Info("Siap v1.1 (hook: pemain=%d anim=%d hidrolik=%d, IFP=%d)",
                  (int)(PlayerProcess_orig != NULL), (int)(AnimUpdate_orig != NULL), (int)(HydraUpdate_orig != NULL), (int)S.useIfp);
 }
