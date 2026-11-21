@@ -1,0 +1,15 @@
+name: Build BulletTimeSA64
+on:
+  push:
+  workflow_dispatch:
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: ndk-build (arm64-v8a)
+        run: | "$ANDROID_NDK_LATEST_HOME/ndk-build" NDK_PROJECT_PATH=. APP_BUILD_SCRIPT=Android.mk NDK_APPLICATION_MK=Application.mk -j4       - name: Siapkan paket
+        run: | mkdir -p out/mods out/configs cp libs/arm64-v8a/libBulletTimeSA64.so out/mods/ cp BulletTime.ini out/configs/       - uses: actions/upload-artifact@v4
+        with:
+          name: BulletTimeSA64
+          path: out/
