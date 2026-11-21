@@ -34,7 +34,10 @@ typedef void   (*HydraDraw_t)(void*);
 typedef bool   (*WidgetIsTouched_t)(void*, void*);      // virtual CWidget::IsTouched(CVector2D*) (vtable +160)
 typedef void*  (*GetAnimationBlock_t)(const char*);
 typedef void*  (*RegisterAnimBlock_t)(const char*);
-typedef void   (*LoadAnimFile_t)(const char*);
+struct RwMemory { uint8_t* start; uint32_t length; };
+typedef void*  (*RwStreamOpen_t)(int, int, const void*);   // RwStreamOpen(type, access, data)
+typedef int    (*RwStreamClose_t)(void*, void*);           // RwStreamClose(stream, data)
+typedef void   (*LoadAnimFile_t)(void*, bool, const char (*)[32]); // CAnimManager::LoadAnimFile(RwStream*, bool, ...)
 typedef void*  (*GetAnimation_t)(const char*, const void*);
 typedef void*  (*BlendAnimation_t)(void*, void*, int, float);
 
@@ -51,6 +54,8 @@ static HydraDraw_t        HydraDraw_orig = NULL;
 static GetAnimationBlock_t GetAnimationBlock = NULL;
 static RegisterAnimBlock_t RegisterAnimBlock = NULL;
 static LoadAnimFile_t     LoadAnimFile = NULL;
+static RwStreamOpen_t     RwStreamOpenFn = NULL;
+static RwStreamClose_t    RwStreamCloseFn = NULL;
 static GetAnimation_t     GetAnimationFn = NULL;
 static BlendAnimation_t   BlendAnimation = NULL;
 
@@ -209,7 +214,7 @@ static void LoadIfp()
 {
     gIfpTried = true;
     if(!S.useIfp) return;
-    if(!LoadAnimFile || !GetAnimationFn || !GetAnimationBlock || !BlendAnimation) { FLog("IFP: fungsi CAnimManager tidak lengkap"); return; }
+    if(!LoadAnimFile || !GetAnimationFn || !GetAnimationBlock || !BlendAnimation || !RwStreamOpenFn || !RwStreamCloseFn) { FLog("IFP: fungsi CAnimManager/RwStream tidak lengkap"); return; }
 
     char path[500];
     if(S.ifpPath[0]) snprintf(path, sizeof(path), "%s", S.ifpPath);
@@ -232,7 +237,28 @@ static void LoadIfp()
 
     // loader bawaan mendaftarkan blok dari header sendiri (RegisterAnimBlock tidak perlu dipanggil)
     void* blk = GetAnimationBlock(blockName);
-    if(!blk) LoadAnimFile(path);
+    if(!blk)
+    {
+        // baca file ke memori dan buka sebagai stream memori RenderWare
+        // (LoadAnimFile(path) langsung crash di port Android karena stream file gagal dibuka)
+        FILE* g = fopen(path, "rb");
+        if(!g) { FLog("IFP: gagal membuka %s", path); return; }
+        fseek(g, 0, SEEK_END); long size = ftell(g); fseek(g, 0, SEEK_SET);
+        if(size < 64 || size > 64 * 1024 * 1024) { fclose(g); FLog("IFP: ukuran file aneh (%ld)", size); return; }
+        uint8_t* buf = (uint8_t*)malloc((size_t)size);
+        if(!buf || fread(buf, 1, (size_t)size, g) != (size_t)size) { fclose(g); free(buf); FLog("IFP: gagal membaca file"); return; }
+        fclose(g);
+
+        RwMemory mem = { buf, (uint32_t)size };
+        FLog("IFP: membuka stream memori (%ld byte)", size);
+        void* st = RwStreamOpenFn(3 /*rwSTREAMMEMORY*/, 1 /*rwSTREAMREAD*/, &mem);
+        if(!st) { FLog("IFP: RwStreamOpen gagal"); free(buf); return; }
+        FLog("IFP: memanggil CAnimManager::LoadAnimFile");
+        LoadAnimFile(st, true, NULL);
+        FLog("IFP: LoadAnimFile selesai");
+        RwStreamCloseFn(st, &mem);
+        free(buf);
+    }
     blk = GetAnimationBlock(blockName);
     if(!blk) { FLog("IFP: blok '%s' tidak terdaftar setelah LoadAnimFile (%s)", blockName, path); return; }
 
@@ -483,7 +509,9 @@ ON_MOD_LOAD()
     if(S.useIfp)
     {
         GetAnimationBlock = (GetAnimationBlock_t)Sym(lib, "_ZN12CAnimManager17GetAnimationBlockEPKc");
-        LoadAnimFile      = (LoadAnimFile_t)Sym(lib, "_ZN12CAnimManager12LoadAnimFileEPKc");
+        LoadAnimFile      = (LoadAnimFile_t)Sym(lib, "_ZN12CAnimManager12LoadAnimFileEP8RwStreambPA32_Kc");
+        RwStreamOpenFn    = (RwStreamOpen_t)Sym(lib, "_Z12RwStreamOpen12RwStreamType18RwStreamAccessTypePKv");
+        RwStreamCloseFn   = (RwStreamClose_t)Sym(lib, "_Z13RwStreamCloseP8RwStreamPv");
         GetAnimationFn    = (GetAnimation_t)Sym(lib, "_ZN12CAnimManager12GetAnimationEPKcPK10CAnimBlock");
         BlendAnimation    = (BlendAnimation_t)Sym(lib, "_ZN12CAnimManager14BlendAnimationEP7RpClumpP19CAnimBlendHierarchyif");
     }
@@ -507,7 +535,7 @@ ON_MOD_LOAD()
     }
     else if(S.hydraButton) logger->Error("Tombol hidrolik di mode jalan TIDAK dipasang");
 
-    FLog("=== BulletTimeSA64 v1.3 dimulai ===");
-    logger->Info("Siap v1.3 (hook: pemain=%d anim=%d hidrolik=%d, IFP=%d)",
+    FLog("=== BulletTimeSA64 v1.4 dimulai ===");
+    logger->Info("Siap v1.4 (hook: pemain=%d anim=%d hidrolik=%d, IFP=%d)",
                  (int)(PlayerProcess_orig != NULL), (int)(AnimUpdate_orig != NULL), (int)(HydraUpdate_orig != NULL), (int)S.useIfp);
 }

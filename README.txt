@@ -25,3 +25,5 @@ Jalan kaki ~10 detik, lalu naik kendaraan sebentar, lalu kirim isi file itu.
 
 v1.3: tombol hidrolik sekarang diberi alpha/enabled supaya terlihat saat jalan kaki; IFP dimuat lewat loader game.
 Kalau di HP masih ada configs/BulletTime.ini lama dengan UseIFP=0, ubah jadi UseIFP=1 atau hapus file itu.
+
+v1.4: IFP dimuat lewat stream memori RenderWare (LoadAnimFile(path) crash di port Android).
