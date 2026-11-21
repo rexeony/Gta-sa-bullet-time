@@ -125,7 +125,7 @@ static void LoadSettings()
     S.diveUp         = CF("DiveUpSpeed", 0.20f, "Dodge");
     S.autoBulletTime = CB("AutoBulletTime", true, "Dodge");
     S.diveSlow       = CF("DiveSlowSeconds", 2.5f, "Dodge");
-    S.useIfp         = CB("UseIFP", false, "Dodge");
+    S.useIfp         = CB("UseIFP", true, "Dodge");
     CS("IFPPath", "", "Dodge", S.ifpPath, sizeof(S.ifpPath));
     S.animFlags      = (int)CF("AnimFlags", 0.0f, "Dodge");
     S.animBlend      = CF("AnimBlend", 8.0f, "Dodge");
@@ -209,22 +209,36 @@ static void LoadIfp()
 {
     gIfpTried = true;
     if(!S.useIfp) return;
-    if(!LoadAnimFile || !GetAnimationFn || !BlendAnimation || !RegisterAnimBlock) { logger->Error("IFP: fungsi CAnimManager tidak lengkap"); return; }
+    if(!LoadAnimFile || !GetAnimationFn || !GetAnimationBlock || !BlendAnimation) { FLog("IFP: fungsi CAnimManager tidak lengkap"); return; }
 
     char path[500];
     if(S.ifpPath[0]) snprintf(path, sizeof(path), "%s", S.ifpPath);
-    else snprintf(path, sizeof(path), "%s/BulletTime/MP3SD.ifp", aml->GetAndroidDataPath());
-    if(!aml->FileExists(path)) { logger->Error("IFP: file tidak ada: %s", path); return; }
+    else
+    {
+        snprintf(path, sizeof(path), "%s/BulletTime/MP3SD.ifp", aml->GetAndroidDataPath());
+        if(!aml->FileExists(path)) snprintf(path, sizeof(path), "%s/MP3SD.ifp", aml->GetAndroidDataPath());
+    }
+    if(!aml->FileExists(path)) { FLog("IFP: file tidak ada: %s", path); return; }
 
-    void* blk = GetAnimationBlock ? GetAnimationBlock("MP3SD") : NULL;
-    if(!blk) blk = RegisterAnimBlock("MP3SD");
-    LoadAnimFile(path);
-    if(!blk && GetAnimationBlock) blk = GetAnimationBlock("MP3SD");
-    if(!blk) { logger->Error("IFP: blok MP3SD tidak terdaftar"); return; }
+    // nama blok animasi ada di header IFP (ANP3): 'ANP3'(4) + ukuran(4) + nama(24)
+    char blockName[25] = {0};
+    FILE* f = fopen(path, "rb");
+    if(!f) { FLog("IFP: gagal membuka %s", path); return; }
+    unsigned char hdr[32];
+    size_t got = fread(hdr, 1, 32, f);
+    fclose(f);
+    if(got != 32 || memcmp(hdr, "ANP3", 4) != 0) { FLog("IFP: header bukan ANP3 (format tidak didukung)"); return; }
+    memcpy(blockName, hdr + 8, 24);
+
+    // loader bawaan mendaftarkan blok dari header sendiri (RegisterAnimBlock tidak perlu dipanggil)
+    void* blk = GetAnimationBlock(blockName);
+    if(!blk) LoadAnimFile(path);
+    blk = GetAnimationBlock(blockName);
+    if(!blk) { FLog("IFP: blok '%s' tidak terdaftar setelah LoadAnimFile (%s)", blockName, path); return; }
 
     int found = 0;
     for(int i = 0; i < 4; ++i) { gDiveHier[i] = GetAnimationFn(kDiveNames[i], blk); if(gDiveHier[i]) ++found; }
-    logger->Info("IFP: %d/4 animasi dive ditemukan", found);
+    FLog("IFP: blok '%s' dimuat dari %s, %d/4 animasi dive ditemukan", blockName, path, found);
 }
 
 static bool DoDodge(void* ped, int16_t* pad)
@@ -257,6 +271,7 @@ static bool DoDodge(void* ped, int16_t* pad)
         if(clump) { BlendAnimation(clump, gDiveHier[dir], S.animFlags, S.animBlend); animPlayed = true; }
     }
     if(!animPlayed) pad[kBtnSquare] = 255;       // tanpa IFP: lompat bawaan supaya CJ terangkat
+    { static int n = 0; if(++n <= 8) FLog("Dodge #%d arah=%d anim=%d", n, dir, (int)animPlayed); }
 
     if(S.autoBulletTime && gMeter > S.activationMin) gDiveSlow = S.diveSlow;
     return true;
@@ -411,11 +426,13 @@ static void HydraUpdate_hook(void* self)
     {
         gHydraLogged = true;
         gHFirstFoot = RealNow();
-        FLog("Hydra Update dipanggil saat jalan kaki. Sebelum: aktif=%d tampil=%d flag140=0x%x", (int)w[200], (int)w[201], *fl);
+        FLog("Hydra Update dipanggil saat jalan kaki. Sebelum: aktif=%d tampil=%d enabled=%d alpha=%d flag140=0x%x", (int)w[200], (int)w[201], (int)w[89], (int)w[88], *fl);
     }
     *fl = (*fl & ~S.hydraFlagClear) | S.hydraFlagSet;
-    w[200] = 1;
-    w[201] = 1;
+    w[200] = 1;      // aktif
+    w[201] = 1;      // tampil
+    w[89]  = 1;      // CWidget "enabled" (SetEnabled)
+    w[88]  = 255;    // alpha saat ini; 0 = digambar transparan (penyebab tombol tak terlihat)
     if(gHFirstFoot > 0.0 && !gHSumLogged && RealNow() - gHFirstFoot > 8.0)
     {
         gHSumLogged = true;
@@ -424,7 +441,12 @@ static void HydraUpdate_hook(void* self)
 
     void** vt = *(void***)self;
     bool touched = ((WidgetIsTouched_t)vt[20])(self, NULL);
-    if(touched && !gHydraPrev) gHydraTap = true;
+    if(touched && !gHydraPrev)
+    {
+        gHydraTap = true;
+        static int taps = 0;
+        if(++taps <= 8) FLog("Tombol hidrolik ditekan (#%d)", taps);
+    }
     gHydraPrev = touched;
 }
 
@@ -461,7 +483,6 @@ ON_MOD_LOAD()
     if(S.useIfp)
     {
         GetAnimationBlock = (GetAnimationBlock_t)Sym(lib, "_ZN12CAnimManager17GetAnimationBlockEPKc");
-        RegisterAnimBlock = (RegisterAnimBlock_t)Sym(lib, "_ZN12CAnimManager17RegisterAnimBlockEPKc");
         LoadAnimFile      = (LoadAnimFile_t)Sym(lib, "_ZN12CAnimManager12LoadAnimFileEPKc");
         GetAnimationFn    = (GetAnimation_t)Sym(lib, "_ZN12CAnimManager12GetAnimationEPKcPK10CAnimBlock");
         BlendAnimation    = (BlendAnimation_t)Sym(lib, "_ZN12CAnimManager14BlendAnimationEP7RpClumpP19CAnimBlendHierarchyif");
@@ -486,7 +507,7 @@ ON_MOD_LOAD()
     }
     else if(S.hydraButton) logger->Error("Tombol hidrolik di mode jalan TIDAK dipasang");
 
-    FLog("=== BulletTimeSA64 v1.2 dimulai ===");
-    logger->Info("Siap v1.1 (hook: pemain=%d anim=%d hidrolik=%d, IFP=%d)",
+    FLog("=== BulletTimeSA64 v1.3 dimulai ===");
+    logger->Info("Siap v1.3 (hook: pemain=%d anim=%d hidrolik=%d, IFP=%d)",
                  (int)(PlayerProcess_orig != NULL), (int)(AnimUpdate_orig != NULL), (int)(HydraUpdate_orig != NULL), (int)S.useIfp);
 }

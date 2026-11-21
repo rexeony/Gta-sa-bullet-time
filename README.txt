@@ -22,3 +22,6 @@ mencari hook penyebabnya, dan kirim log "BulletTimeSA64" dari logcat.
 
 Diagnosa tombol hidrolik: mod menulis /sdcard/Android/data/com.rockstargames.gtasa/files/BulletTime_log.txt
 Jalan kaki ~10 detik, lalu naik kendaraan sebentar, lalu kirim isi file itu.
+
+v1.3: tombol hidrolik sekarang diberi alpha/enabled supaya terlihat saat jalan kaki; IFP dimuat lewat loader game.
+Kalau di HP masih ada configs/BulletTime.ini lama dengan UseIFP=0, ubah jadi UseIFP=1 atau hapus file itu.
