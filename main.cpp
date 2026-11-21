@@ -35,6 +35,9 @@ typedef bool   (*WidgetIsTouched_t)(void*, void*);      // virtual CWidget::IsTo
 typedef void*  (*GetAnimationBlock_t)(const char*);
 typedef void*  (*RegisterAnimBlock_t)(const char*);
 struct RwMemory { uint8_t* start; uint32_t length; };
+struct CRect { float left, bottom, right, top; };      // bottom = y lebih besar (layar y ke bawah)
+struct CRGBA { uint8_t r, g, b, a; };
+typedef void   (*DrawRect_t)(const CRect&, const CRGBA&); // CSprite2d::DrawRect
 typedef void*  (*RwStreamOpen_t)(int, int, const void*);   // RwStreamOpen(type, access, data)
 typedef int    (*RwStreamClose_t)(void*, void*);           // RwStreamClose(stream, data)
 typedef void   (*LoadAnimFile_t)(void*, bool, const char (*)[32]); // CAnimManager::LoadAnimFile(RwStream*, bool, ...)
@@ -54,6 +57,8 @@ static HydraDraw_t        HydraDraw_orig = NULL;
 static GetAnimationBlock_t GetAnimationBlock = NULL;
 static RegisterAnimBlock_t RegisterAnimBlock = NULL;
 static LoadAnimFile_t     LoadAnimFile = NULL;
+static DrawRect_t         DrawRectFn = NULL;
+static uint8_t*           pRsGlobal = NULL;        // RsGlobal: +8 lebar layar, +12 tinggi layar
 static RwStreamOpen_t     RwStreamOpenFn = NULL;
 static RwStreamClose_t    RwStreamCloseFn = NULL;
 static GetAnimation_t     GetAnimationFn = NULL;
@@ -63,7 +68,9 @@ static BlendAnimation_t   BlendAnimation = NULL;
 struct Settings
 {
     bool  enabled, debugPad, holdToActivate, autoBulletTime, hydraButton, hydraDodge, useIfp;
-    bool  hookPlayer, hookAnim, hookHydra;
+    bool  hookPlayer, hookAnim, hookHydra, showBar, fallbackJump;
+    int   hydraMode;
+    float barX, barY, barW, barH;
     unsigned hydraFlagClear, hydraFlagSet;
     int   activateBtn, diveBtn, animFlags;
     float animBlend, cjSpeed, worldSpeed, blendIn, blendOut, duration, refill, startMeter, activationMin;
@@ -123,8 +130,15 @@ static void LoadSettings()
     S.startMeter     = CF("StartMeter", 1.0f, "BulletTime");
     S.activationMin  = CF("ActivationMinimum", 0.05f, "BulletTime");
 
+    S.showBar        = CB("ShowBar", true, "Bar");
+    S.barX           = CF("BarX", 0.35f, "Bar");      // posisi kiri bar (pecahan lebar layar)
+    S.barY           = CF("BarY", 0.04f, "Bar");      // posisi atas bar (pecahan tinggi layar)
+    S.barW           = CF("BarWidth", 0.30f, "Bar");
+    S.barH           = CF("BarHeight", 0.022f, "Bar");
+    S.fallbackJump   = CB("FallbackJump", true, "Dodge");
+    S.hydraMode      = (int)CF("HydraulicsMode", 0.0f, "BulletTime"); // 0 = tap: bullet time, tap 2x: dodge | 1 = tap langsung dodge
     S.hydraDodge     = CB("HydraulicsDoubleTapDodge", true, "Dodge");
-    S.tapWindow      = CF("DoubleTapWindow", 0.35f, "Dodge");
+    S.tapWindow      = CF("DoubleTapWindow", 0.5f, "Dodge");
     S.diveBtn        = CPadBtn("DiveButton", "None", "Dodge");
     S.diveForward    = CF("DiveSpeed", 0.30f, "Dodge");
     S.diveUp         = CF("DiveUpSpeed", 0.20f, "Dodge");
@@ -164,7 +178,8 @@ static bool  gInPlayerProcess = false;
 static bool  gManual = false;
 static float gDiveSlow = 0.0f;
 static bool  gHydraPrev = false, gHydraTap = false, gHydraLogged = false;
-static float gHydraLast = -10.0f, gLastTap = -10.0f;
+static double gHydraLast = -10.0;
+static float gLastTap = -10.0f;
 static bool  gPrevActivate = false, gPrevDive = false;
 static int16_t gPrevPad[20];
 static bool  gIfpTried = false;
@@ -269,9 +284,14 @@ static void LoadIfp()
 
 static bool DoDodge(void* ped, int16_t* pad)
 {
-    if(!ApplyMoveForce || !ped) return false;
+    if(!ApplyMoveForce || !ped) { FLog("Dodge: ApplyMoveForce=%p ped=%p", (void*)ApplyMoveForce, ped); return false; }
     float fx, fy;
-    if(!GetPedForward(ped, fx, fy)) { logger->Error("Dodge: arah hadap ped tidak valid"); return false; }
+    if(!GetPedForward(ped, fx, fy))
+    {
+        uintptr_t b = (uintptr_t)ped; void* mat = *(void**)(b + 0x18);
+        FLog("Dodge: arah hadap ped tidak valid (matrix=%p heading=%.2f)", mat, *(float*)(b + 0x14));
+        return false;
+    }
 
     int dir = 0;                                 // 0 maju, 1 mundur, 2 kiri, 3 kanan
     int sx = pad[0], sy = pad[1];
@@ -291,13 +311,15 @@ static bool DoDodge(void* ped, int16_t* pad)
     ApplyMoveForce(ped, force);
 
     bool animPlayed = false;
-    if(gDiveHier[dir] && BlendAnimation)
+    void* assoc = NULL;
+    void* clump = *(void**)((uintptr_t)ped + 0x20);
+    if(gDiveHier[dir] && BlendAnimation && clump)
     {
-        void* clump = *(void**)((uintptr_t)ped + 0x20);
-        if(clump) { BlendAnimation(clump, gDiveHier[dir], S.animFlags, S.animBlend); animPlayed = true; }
+        assoc = BlendAnimation(clump, gDiveHier[dir], S.animFlags, S.animBlend);
+        animPlayed = assoc != NULL;
     }
-    if(!animPlayed) pad[kBtnSquare] = 255;       // tanpa IFP: lompat bawaan supaya CJ terangkat
-    { static int n = 0; if(++n <= 8) FLog("Dodge #%d arah=%d anim=%d", n, dir, (int)animPlayed); }
+    if(!animPlayed && S.fallbackJump) pad[kBtnSquare] = 255;   // tanpa IFP: lompat bawaan supaya CJ terangkat
+    { static int n = 0; if(++n <= 8) FLog("Dodge #%d arah=%d hier=%p clump=%p assoc=%p fwd=(%.2f,%.2f) massa=%.0f", n, dir, gDiveHier[dir], clump, assoc, fx, fy, mass); }
 
     if(S.autoBulletTime && gMeter > S.activationMin) gDiveSlow = S.diveSlow;
     return true;
@@ -323,14 +345,18 @@ static void Tick(void* ped)
         }
     }
 
-    // tombol hidrolik di mode jalan: 1x tap = bullet time on/off, 2x tap cepat = dodge
+    // tombol hidrolik di mode jalan: mode 0 = tap bullet time on/off, tap 2x cepat = dodge; mode 1 = tap = dodge
     if(gHydraTap)
     {
         gHydraTap = false;
+        double now = RealNow();
+        double gap = now - gHydraLast;
+        bool dodge = (S.hydraMode == 1) || (S.hydraDodge && gap <= S.tapWindow);
+        static int tn = 0;
+        if(++tn <= 24) FLog("Tap #%d selang=%.2fs aksi=%s bisa=%d meter=%.2f", tn, gap > 100.0 ? -1.0 : gap, dodge ? "dodge" : "bullet-time", (int)canAct, gMeter);
         if(canAct)
         {
-            float now = (float)RealNow();
-            if(S.hydraDodge && now - gHydraLast <= S.tapWindow) { DoDodge(ped, pad); gHydraLast = -10.0f; }
+            if(dodge) { bool ok = DoDodge(ped, pad); if(!ok) FLog("Dodge gagal dijalankan (lihat baris di atas)"); gHydraLast = -10.0; }
             else
             {
                 if(gManual) gManual = false;
@@ -476,10 +502,43 @@ static void HydraUpdate_hook(void* self)
     gHydraPrev = touched;
 }
 
+// Bar adrenalin bullet time (digambar tiap frame saat jalan kaki, dari hook Draw tombol hidrolik)
+static void DrawBar()
+{
+    if(!S.showBar || !DrawRectFn || !pRsGlobal) return;
+    int W = *(int*)(pRsGlobal + 8), H = *(int*)(pRsGlobal + 12);
+    static bool logged = false;
+    if(!logged) { logged = true; FLog("Bar: layar %dx%d", W, H); }
+    if(W < 200 || W > 10000 || H < 200 || H > 10000) return;
+
+    float x = S.barX * W, y = S.barY * H, w = S.barW * W, h = S.barH * H;
+    float pad = h * 0.18f; if(pad < 1.5f) pad = 1.5f;
+
+    CRGBA border = { 0, 0, 0, 200 };
+    CRect rb = { x - 1.0f, y + h + 1.0f, x + w + 1.0f, y - 1.0f };
+    DrawRectFn(rb, border);
+    CRGBA back = { 25, 25, 30, 170 };
+    CRect rk = { x, y + h, x + w, y };
+    DrawRectFn(rk, back);
+
+    float m = gMeter < 0.0f ? 0.0f : (gMeter > 1.0f ? 1.0f : gMeter);
+    float fw = (w - 2.0f * pad) * m;
+    if(fw > 0.5f)
+    {
+        CRGBA col;
+        if(BulletTimeOn()) col = { 90, 210, 255, 235 };        // aktif
+        else if(m < 0.25f) col = { 255, 130, 60, 220 };        // hampir habis / mengisi
+        else col = { 235, 235, 235, 210 };
+        CRect rf = { x + pad, y + h - pad, x + pad + fw, y + pad };
+        DrawRectFn(rf, col);
+    }
+}
+
 static void HydraDraw_hook(void* self)
 {
     if(gOnFootNow) ++gHDrawFoot;
     HydraDraw_orig(self);
+    if(gOnFootNow) DrawBar();
 }
 
 // ---------------------------------------------------------------- init
@@ -516,6 +575,8 @@ ON_MOD_LOAD()
         BlendAnimation    = (BlendAnimation_t)Sym(lib, "_ZN12CAnimManager14BlendAnimationEP7RpClumpP19CAnimBlendHierarchyif");
     }
 
+    DrawRectFn = (DrawRect_t)Sym(lib, "_ZN9CSprite2d8DrawRectERK5CRectRK5CRGBA");
+    pRsGlobal  = (uint8_t*)Sym(lib, "RsGlobal");
     uintptr_t playerProcess = Sym(lib, "_ZN10CPlayerPed14ProcessControlEv");
     uintptr_t animUpdate    = Sym(lib, "_Z32RpAnimBlendClumpUpdateAnimationsP7RpClumpfb");
     uintptr_t hydraUpdate   = Sym(lib, "_ZN23CWidgetButtonHydraulics6UpdateEv");
@@ -535,7 +596,7 @@ ON_MOD_LOAD()
     }
     else if(S.hydraButton) logger->Error("Tombol hidrolik di mode jalan TIDAK dipasang");
 
-    FLog("=== BulletTimeSA64 v1.4 dimulai ===");
-    logger->Info("Siap v1.4 (hook: pemain=%d anim=%d hidrolik=%d, IFP=%d)",
+    FLog("=== BulletTimeSA64 v1.6 dimulai ===");
+    logger->Info("Siap v1.6 (hook: pemain=%d anim=%d hidrolik=%d, IFP=%d)",
                  (int)(PlayerProcess_orig != NULL), (int)(AnimUpdate_orig != NULL), (int)(HydraUpdate_orig != NULL), (int)S.useIfp);
 }
