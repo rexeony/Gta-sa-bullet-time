@@ -14,3 +14,8 @@ Pakai:
 
 Log: logcat tag "BulletTimeSA64".
 Terinspirasi dari "Frnchise Bullet Time" oleh frnchise; kode ditulis ulang dari nol.
+
+PENTING: kalau sebelumnya sudah pernah menjalankan versi lama, HAPUS file configs/BulletTime.ini lama
+supaya dibuat ulang dengan nilai baru.
+Kalau masih crash: set HookAnim=0, lalu HookHydra=0, lalu HookPlayer=0 satu per satu di .ini untuk
+mencari hook penyebabnya, dan kirim log "BulletTimeSA64" dari logcat.
