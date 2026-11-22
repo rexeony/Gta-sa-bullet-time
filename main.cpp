@@ -73,6 +73,9 @@ static MakeAbortable_t    MakeAbortableFn = NULL;
 static PadBool_t          EnterT_orig = NULL, ExitT_orig = NULL;
 static PadTarget_t        Target_orig = NULL;
 static IsTouched_t        IsTouchedFn = NULL;
+static uint8_t*           pUserPause = NULL;       // CTimer::m_UserPause (menu/pause aktif)
+static uint8_t*           pCodePause = NULL;       // CTimer::m_CodePause
+static inline bool GamePaused() { return (pUserPause && *pUserPause) || (pCodePause && *pCodePause); }
 static char               gBlockName[32] = {0};
 static DrawRect_t         DrawRectFn = NULL;
 static uint8_t*           pRsGlobal = NULL;        // RsGlobal: +8 lebar layar, +12 tinggi layar
@@ -158,9 +161,9 @@ static void LoadSettings()
     S.forceAim       = CB("ForceAimWhileDiving", true, "Aim");     // paksa mode bidik selama dive
     S.logAim         = CB("LogAim", true, "Aim");                  // catat perubahan status aim ke log
     S.hookTarget     = CB("HookGetTarget", false, "Aim");
-    S.debugWidgets   = CB("LogTouchedWidgets", true, "Aim");   // catat ID widget sentuh yang disentuh (diagnosa)
-    S.hookAimEnter   = CB("HookGetEnterTargeting", true, "Aim");
-    S.hookAimExit    = CB("HookGetExitTargeting", true, "Aim");
+    S.debugWidgets   = CB("LogTouchedWidgets", false, "Aim");   // catat ID widget sentuh yang disentuh (diagnosa)
+    S.hookAimEnter   = CB("HookGetEnterTargeting", false, "Aim");
+    S.hookAimExit    = CB("HookGetExitTargeting", false, "Aim");
     S.useTask        = CB("UseAnimTask", true, "Dodge");          // main animasi lewat task bawaan game (tidak ditimpa)
     S.useSecondary   = CB("AnimInSecondarySlot", true, "Dodge");   // slot sekunder (parsial): kontrol & aim pemain tetap jalan
     S.taskFlags      = (int)CF("TaskFlags", 16.0f, "Dodge");        // 16 = ANIM_FLAG_PARTIAL
@@ -576,7 +579,7 @@ static void ProbeWidgets()
 
 static void PlayerProcess_hook(void* self)
 {
-    if(S.enabled)
+    if(S.enabled && !GamePaused())
     {
         gAimFlagNow = (int)((*(uint64_t*)((uintptr_t)self + 1412) >> 4) & 1);
         Tick(self); ApplyDash(self); ProbeWidgets();
@@ -592,7 +595,7 @@ static void PlayerProcess_hook(void* self)
         *pTimeStep = saved;
     }
     else PlayerProcess_orig(self);
-    if(S.enabled) { ApplyDash(self); gAimFlagNow = (int)((*(uint64_t*)((uintptr_t)self + 1412) >> 4) & 1); AimProbe(self, "setelah"); }
+    if(S.enabled && !GamePaused()) { ApplyDash(self); gAimFlagNow = (int)((*(uint64_t*)((uintptr_t)self + 1412) >> 4) & 1); AimProbe(self, "setelah"); }
 }
 
 // --- status aim (membidik) ---
@@ -653,7 +656,7 @@ static bool  gOnFootNow = false;
 static void HydraUpdate_hook(void* self)
 {
     HydraUpdate_orig(self);
-    if(!S.enabled || !S.hydraButton || !FindPlayerPed) return;
+    if(!S.enabled || !S.hydraButton || !FindPlayerPed || GamePaused()) return;
     uint8_t* w = (uint8_t*)self;
     uint32_t* fl = (uint32_t*)(w + 140);
 
@@ -738,7 +741,7 @@ static void HydraDraw_hook(void* self)
 {
     if(gOnFootNow) ++gHDrawFoot;
     HydraDraw_orig(self);
-    if(gOnFootNow) DrawBar();
+    if(gOnFootNow && !GamePaused()) DrawBar();
 }
 
 // ---------------------------------------------------------------- init
@@ -783,6 +786,8 @@ ON_MOD_LOAD()
     DrawRectFn = (DrawRect_t)Sym(lib, "_ZN9CSprite2d8DrawRectERK5CRectRK5CRGBA");
     pRsGlobal  = (uint8_t*)Sym(lib, "RsGlobal");
     IsTouchedFn = (IsTouched_t)Sym(lib, "_ZN15CTouchInterface9IsTouchedENS_9WidgetIDsEP9CVector2Di");
+    pUserPause = (uint8_t*)Sym(lib, "_ZN6CTimer11m_UserPauseE");
+    pCodePause = (uint8_t*)Sym(lib, "_ZN6CTimer11m_CodePauseE");
     uintptr_t aimTarget = Sym(lib, "_ZN4CPad9GetTargetEb");
     uintptr_t aimEnter  = Sym(lib, "_ZN4CPad17GetEnterTargetingEv");
     uintptr_t aimExit   = Sym(lib, "_ZN4CPad16GetExitTargetingEv");
@@ -805,11 +810,11 @@ ON_MOD_LOAD()
     }
     else if(S.hydraButton) logger->Error("Tombol hidrolik di mode jalan TIDAK dipasang");
 
-    FLog("=== BulletTimeSA64 v1.11 dimulai ===");
+    FLog("=== BulletTimeSA64 v1.12 dimulai ===");
     if(S.hookTarget && aimTarget) aml->Hook((void*)aimTarget, (void*)Target_hook, (void**)&Target_orig);
     if(S.hookAimEnter && aimEnter) aml->Hook((void*)aimEnter, (void*)EnterT_hook, (void**)&EnterT_orig);
     if(S.hookAimExit && aimExit) aml->Hook((void*)aimExit, (void*)ExitT_hook, (void**)&ExitT_orig);
 
-    logger->Info("Siap v1.11 (hook: pemain=%d anim=%d hidrolik=%d, IFP=%d)",
+    logger->Info("Siap v1.12 (hook: pemain=%d anim=%d hidrolik=%d, IFP=%d)",
                  (int)(PlayerProcess_orig != NULL), (int)(AnimUpdate_orig != NULL), (int)(HydraUpdate_orig != NULL), (int)S.useIfp);
 }
