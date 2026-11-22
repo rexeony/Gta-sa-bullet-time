@@ -49,7 +49,8 @@ typedef void   (*SetTask_t)(void*, void*, int, bool);
 typedef void   (*SetTaskSecondary_t)(void*, void*, int);
 typedef bool   (*MakeAbortable_t)(void*, void*, int, const void*);
 typedef bool   (*PadBool_t)(void*);                 // CPad::GetEnterTargeting() / GetExitTargeting()
-typedef bool   (*PadTarget_t)(void*, bool);         // CPad::GetTarget(bool)                // CTaskSimpleAnim::MakeAbortable(ped, priority, event)                           // CTaskManager::SetTaskSecondary(task, slot)                              // CTaskManager::SetTask(task, slot, bool)
+typedef bool   (*PadTarget_t)(void*, bool);         // CPad::GetTarget(bool)
+typedef bool   (*IsTouched_t)(int, void*, int);     // CTouchInterface::IsTouched(WidgetIDs, CVector2D*, int)                // CTaskSimpleAnim::MakeAbortable(ped, priority, event)                           // CTaskManager::SetTaskSecondary(task, slot)                              // CTaskManager::SetTask(task, slot, bool)
 
 static GetPad_t           GetPad = NULL;
 static FindPlayerPed_t    FindPlayerPed = NULL;
@@ -71,6 +72,7 @@ static SetTaskSecondary_t SetTaskSecFn = NULL;
 static MakeAbortable_t    MakeAbortableFn = NULL;
 static PadBool_t          EnterT_orig = NULL, ExitT_orig = NULL;
 static PadTarget_t        Target_orig = NULL;
+static IsTouched_t        IsTouchedFn = NULL;
 static char               gBlockName[32] = {0};
 static DrawRect_t         DrawRectFn = NULL;
 static uint8_t*           pRsGlobal = NULL;        // RsGlobal: +8 lebar layar, +12 tinggi layar
@@ -85,7 +87,7 @@ struct Settings
     bool  enabled, debugPad, holdToActivate, autoBulletTime, hydraButton, hydraDodge, useIfp;
     bool  hookPlayer, hookAnim, hookHydra, showBar, fallbackJump;
     int   hydraMode, taskFlags;
-    bool  useTask, useSecondary, freezeStick, holdLastFrame, forceAim, logAim, hookTarget, hookAimEnter, hookAimExit;
+    bool  useTask, useSecondary, freezeStick, holdLastFrame, forceAim, logAim, hookTarget, hookAimEnter, hookAimExit, debugWidgets;
     float dashSeconds, diveDuration, diveAnimSpeed;
     float barX, barY, barW, barH;
     unsigned hydraFlagClear, hydraFlagSet;
@@ -155,9 +157,10 @@ static void LoadSettings()
     S.fallbackJump   = CB("FallbackJump", true, "Dodge");
     S.forceAim       = CB("ForceAimWhileDiving", true, "Aim");     // paksa mode bidik selama dive
     S.logAim         = CB("LogAim", true, "Aim");                  // catat perubahan status aim ke log
-    S.hookTarget     = CB("HookGetTarget", true, "Aim");
-    S.hookAimEnter   = CB("HookGetEnterTargeting", false, "Aim");  // opsional (uji bertahap)
-    S.hookAimExit    = CB("HookGetExitTargeting", false, "Aim");   // opsional (uji bertahap)
+    S.hookTarget     = CB("HookGetTarget", false, "Aim");
+    S.debugWidgets   = CB("LogTouchedWidgets", true, "Aim");   // catat ID widget sentuh yang disentuh (diagnosa)
+    S.hookAimEnter   = CB("HookGetEnterTargeting", true, "Aim");
+    S.hookAimExit    = CB("HookGetExitTargeting", true, "Aim");
     S.useTask        = CB("UseAnimTask", true, "Dodge");          // main animasi lewat task bawaan game (tidak ditimpa)
     S.useSecondary   = CB("AnimInSecondarySlot", true, "Dodge");   // slot sekunder (parsial): kontrol & aim pemain tetap jalan
     S.taskFlags      = (int)CF("TaskFlags", 16.0f, "Dodge");        // 16 = ANIM_FLAG_PARTIAL
@@ -219,6 +222,7 @@ static bool  gDiveTaskLive = false, gDiveSecondary = false;
 static void* gDiveTask = NULL;
 static float gAimKickT = 0.0f;
 static int   gAimLogN = 0, gLastTargetReal = -1;
+static int   gAimFlagNow = 0;            // bit bIsAimingGun di data CJ (ped+1412, bit 4) = sedang membidik
 static void* gDiveHier[4] = { NULL, NULL, NULL, NULL };
 static const char* kDiveNames[4] = { "sd_dive_fwd", "sd_dive_bkw", "sd_dive_left", "sd_dive_right" };
 
@@ -414,7 +418,7 @@ static bool DoDodge(void* ped, int16_t* pad)
         animPlayed = assoc != NULL;
     }
     if(!animPlayed && S.fallbackJump) pad[kBtnSquare] = 255;   // tanpa IFP: lompat bawaan
-    { static int n = 0; if(++n <= 8) FLog("Dodge #%d arah=%d task=%d slot=%s assoc=%p fwd=(%.2f,%.2f) aimSebelum=%d", n, dir, (int)tasked, gDiveSecondary ? "sekunder" : "utama", assoc, fx, fy, gLastTargetReal); }
+    { static int n = 0; if(++n <= 8) FLog("Dodge #%d arah=%d task=%d slot=%s assoc=%p fwd=(%.2f,%.2f) aimSebelum=%d", n, dir, (int)tasked, gDiveSecondary ? "sekunder" : "utama", assoc, fx, fy, gAimFlagNow); }
 
     if(S.autoBulletTime && gMeter > S.activationMin) gDiveSlow = S.diveSlow;
     return true;
@@ -541,9 +545,42 @@ static void ApplyDash(void* ped)
     ms[1] = gDashDY * S.diveForward * f;
 }
 
+static void AimProbe(void* ped, const char* when)
+{
+    static int lastAim = -1, lastAtk = -1, lastS4 = -1, n = 0;
+    if(!S.logAim || n >= 120) return;
+    void* intel = *(void**)((uintptr_t)ped + 1336);
+    if(!intel) return;
+    uint8_t* mgr = (uint8_t*)intel + 8;
+    int atk = *(void**)(mgr + 40) != NULL;              // slot sekunder 0 = ATTACK (task senjata)
+    int s4 = *(void**)(mgr + 40 + 4 * 8) != NULL;       // slot sekunder 4 = animasi dive
+    if(gAimFlagNow != lastAim || atk != lastAtk || s4 != lastS4)
+    {
+        lastAim = gAimFlagNow; lastAtk = atk; lastS4 = s4; ++n;
+        FLog("AimState(%s): flagBidik=%d taskSenjata=%d taskDive=%d dive=%d", when, gAimFlagNow, atk, s4, (int)gDiveTaskLive);
+    }
+}
+
+// Diagnosa: widget sentuh mana yang sedang disentuh (ID dicatat saat berubah)
+static void ProbeWidgets()
+{
+    if(!S.debugWidgets || !IsTouchedFn) return;
+    static bool prev[200]; static int n = 0;
+    for(int id = 0; id < 130; ++id)
+    {
+        bool t = IsTouchedFn(id, NULL, 1);
+        if(t != prev[id] && n < 150) { ++n; FLog("Widget %d disentuh=%d", id, (int)t); }
+        prev[id] = t;
+    }
+}
+
 static void PlayerProcess_hook(void* self)
 {
-    if(S.enabled) { Tick(self); ApplyDash(self); }
+    if(S.enabled)
+    {
+        gAimFlagNow = (int)((*(uint64_t*)((uintptr_t)self + 1412) >> 4) & 1);
+        Tick(self); ApplyDash(self); ProbeWidgets();
+    }
 
     if(S.enabled && pTimeStep && gFactor > 1.001f)
     {
@@ -555,7 +592,7 @@ static void PlayerProcess_hook(void* self)
         *pTimeStep = saved;
     }
     else PlayerProcess_orig(self);
-    if(S.enabled) ApplyDash(self);
+    if(S.enabled) { ApplyDash(self); gAimFlagNow = (int)((*(uint64_t*)((uintptr_t)self + 1412) >> 4) & 1); AimProbe(self, "setelah"); }
 }
 
 // --- status aim (membidik) ---
@@ -581,7 +618,7 @@ static bool EnterT_hook(void* pad)
 {
     bool r = EnterT_orig(pad);
     LogAim("GetEnterTargeting", r);
-    if(S.enabled && S.forceAim && gAimKickT > 0.0f) r = true;
+    if(S.enabled && S.forceAim && gAimKickT > 0.0f && !gAimFlagNow) r = true;   // mulai membidik kalau belum
     return r;
 }
 static bool ExitT_hook(void* pad)
@@ -745,6 +782,7 @@ ON_MOD_LOAD()
     MakeAbortableFn = (MakeAbortable_t)Sym(lib, "_ZN15CTaskSimpleAnim13MakeAbortableEP4CPediPK6CEvent");
     DrawRectFn = (DrawRect_t)Sym(lib, "_ZN9CSprite2d8DrawRectERK5CRectRK5CRGBA");
     pRsGlobal  = (uint8_t*)Sym(lib, "RsGlobal");
+    IsTouchedFn = (IsTouched_t)Sym(lib, "_ZN15CTouchInterface9IsTouchedENS_9WidgetIDsEP9CVector2Di");
     uintptr_t aimTarget = Sym(lib, "_ZN4CPad9GetTargetEb");
     uintptr_t aimEnter  = Sym(lib, "_ZN4CPad17GetEnterTargetingEv");
     uintptr_t aimExit   = Sym(lib, "_ZN4CPad16GetExitTargetingEv");
@@ -767,11 +805,11 @@ ON_MOD_LOAD()
     }
     else if(S.hydraButton) logger->Error("Tombol hidrolik di mode jalan TIDAK dipasang");
 
-    FLog("=== BulletTimeSA64 v1.10 dimulai ===");
+    FLog("=== BulletTimeSA64 v1.11 dimulai ===");
     if(S.hookTarget && aimTarget) aml->Hook((void*)aimTarget, (void*)Target_hook, (void**)&Target_orig);
     if(S.hookAimEnter && aimEnter) aml->Hook((void*)aimEnter, (void*)EnterT_hook, (void**)&EnterT_orig);
     if(S.hookAimExit && aimExit) aml->Hook((void*)aimExit, (void*)ExitT_hook, (void**)&ExitT_orig);
 
-    logger->Info("Siap v1.10 (hook: pemain=%d anim=%d hidrolik=%d, IFP=%d)",
+    logger->Info("Siap v1.11 (hook: pemain=%d anim=%d hidrolik=%d, IFP=%d)",
                  (int)(PlayerProcess_orig != NULL), (int)(AnimUpdate_orig != NULL), (int)(HydraUpdate_orig != NULL), (int)S.useIfp);
 }
