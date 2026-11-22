@@ -43,6 +43,9 @@ typedef int    (*RwStreamClose_t)(void*, void*);           // RwStreamClose(stre
 typedef void   (*LoadAnimFile_t)(void*, bool, const char (*)[32]); // CAnimManager::LoadAnimFile(RwStream*, bool, ...)
 typedef void*  (*GetAnimation_t)(const char*, const void*);
 typedef void*  (*BlendAnimation_t)(void*, void*, int, float);
+typedef void*  (*TaskNew_t)(size_t);                                              // CTask::operator new
+typedef void   (*RunNamedAnimCtor_t)(void*, const char*, const char*, int, float, int, bool, bool, bool, bool); // CTaskSimpleRunNamedAnim::ctor
+typedef void   (*SetTask_t)(void*, void*, int, bool);                              // CTaskManager::SetTask(task, slot, bool)
 
 static GetPad_t           GetPad = NULL;
 static FindPlayerPed_t    FindPlayerPed = NULL;
@@ -57,6 +60,10 @@ static HydraDraw_t        HydraDraw_orig = NULL;
 static GetAnimationBlock_t GetAnimationBlock = NULL;
 static RegisterAnimBlock_t RegisterAnimBlock = NULL;
 static LoadAnimFile_t     LoadAnimFile = NULL;
+static TaskNew_t          TaskNewFn = NULL;
+static RunNamedAnimCtor_t RunNamedCtor = NULL;
+static SetTask_t          SetTaskFn = NULL;
+static char               gBlockName[32] = {0};
 static DrawRect_t         DrawRectFn = NULL;
 static uint8_t*           pRsGlobal = NULL;        // RsGlobal: +8 lebar layar, +12 tinggi layar
 static RwStreamOpen_t     RwStreamOpenFn = NULL;
@@ -69,7 +76,9 @@ struct Settings
 {
     bool  enabled, debugPad, holdToActivate, autoBulletTime, hydraButton, hydraDodge, useIfp;
     bool  hookPlayer, hookAnim, hookHydra, showBar, fallbackJump;
-    int   hydraMode;
+    int   hydraMode, taskFlags;
+    bool  useTask;
+    float dashSeconds;
     float barX, barY, barW, barH;
     unsigned hydraFlagClear, hydraFlagSet;
     int   activateBtn, diveBtn, animFlags;
@@ -136,12 +145,15 @@ static void LoadSettings()
     S.barW           = CF("BarWidth", 0.30f, "Bar");
     S.barH           = CF("BarHeight", 0.022f, "Bar");
     S.fallbackJump   = CB("FallbackJump", true, "Dodge");
+    S.useTask        = CB("UseAnimTask", true, "Dodge");          // main animasi lewat task bawaan game (tidak ditimpa)
+    S.taskFlags      = (int)CF("TaskFlags", 0.0f, "Dodge");
+    S.dashSeconds    = CF("DashSeconds", 0.35f, "Dodge");
     S.hydraMode      = (int)CF("HydraulicsMode", 0.0f, "BulletTime"); // 0 = tap: bullet time, tap 2x: dodge | 1 = tap langsung dodge
     S.hydraDodge     = CB("HydraulicsDoubleTapDodge", true, "Dodge");
     S.tapWindow      = CF("DoubleTapWindow", 0.5f, "Dodge");
     S.diveBtn        = CPadBtn("DiveButton", "None", "Dodge");
-    S.diveForward    = CF("DiveSpeed", 0.30f, "Dodge");
-    S.diveUp         = CF("DiveUpSpeed", 0.20f, "Dodge");
+    S.diveForward    = CF("DiveSpeed", 0.16f, "Dodge");
+    S.diveUp         = CF("DiveUpSpeed", 0.0f, "Dodge");
     S.autoBulletTime = CB("AutoBulletTime", true, "Dodge");
     S.diveSlow       = CF("DiveSlowSeconds", 2.5f, "Dodge");
     S.useIfp         = CB("UseIFP", true, "Dodge");
@@ -183,6 +195,7 @@ static float gLastTap = -10.0f;
 static bool  gPrevActivate = false, gPrevDive = false;
 static int16_t gPrevPad[20];
 static bool  gIfpTried = false;
+static float gDashT = 0.0f, gDashDX = 0.0f, gDashDY = 0.0f;
 static void* gDiveHier[4] = { NULL, NULL, NULL, NULL };
 static const char* kDiveNames[4] = { "sd_dive_fwd", "sd_dive_bkw", "sd_dive_left", "sd_dive_right" };
 
@@ -249,6 +262,7 @@ static void LoadIfp()
     fclose(f);
     if(got != 32 || memcmp(hdr, "ANP3", 4) != 0) { FLog("IFP: header bukan ANP3 (format tidak didukung)"); return; }
     memcpy(blockName, hdr + 8, 24);
+    memcpy(gBlockName, blockName, sizeof(blockName));
 
     // loader bawaan mendaftarkan blok dari header sendiri (RegisterAnimBlock tidak perlu dipanggil)
     void* blk = GetAnimationBlock(blockName);
@@ -307,19 +321,40 @@ static bool DoDodge(void* ped, int16_t* pad)
 
     float mass = *(float*)((uintptr_t)ped + 176);
     if(!(mass > 1.0f && mass < 2000.0f)) mass = 70.0f;
-    CVector force = { dx * S.diveForward * mass, dy * S.diveForward * mass, S.diveUp * mass };
-    ApplyMoveForce(ped, force);
 
-    bool animPlayed = false;
-    void* assoc = NULL;
+    // dorongan vertikal opsional (bawaan 0 supaya CJ tidak masuk status "melayang" yang menimpa animasi)
+    if(S.diveUp > 0.0f)
+    {
+        CVector up = { 0.0f, 0.0f, S.diveUp * mass };
+        ApplyMoveForce(ped, up);
+    }
+    // meluncur mendatar selama DashSeconds (diterapkan tiap frame di hook pemain)
+    gDashT = S.dashSeconds; gDashDX = dx; gDashDY = dy;
+
+    // animasi lewat task bawaan game: CTaskSimpleRunNamedAnim di slot PRIMARY (3), seperti perintah script TASK_PLAY_ANIM
+    bool tasked = false;
     void* clump = *(void**)((uintptr_t)ped + 0x20);
-    if(gDiveHier[dir] && BlendAnimation && clump)
+    if(S.useTask && gDiveHier[dir] && gBlockName[0] && TaskNewFn && RunNamedCtor && SetTaskFn)
+    {
+        void* intel = *(void**)((uintptr_t)ped + 1336);     // CPed::m_pIntelligence; CTaskManager di +8
+        void* t = intel ? TaskNewFn(120) : NULL;
+        if(t)
+        {
+            RunNamedCtor(t, kDiveNames[dir], gBlockName, S.taskFlags, S.animBlend, -1, false, false, false, false);
+            SetTaskFn((uint8_t*)intel + 8, t, 3, false);
+            tasked = true;
+        }
+    }
+
+    bool animPlayed = tasked;
+    void* assoc = NULL;
+    if(!tasked && gDiveHier[dir] && BlendAnimation && clump)
     {
         assoc = BlendAnimation(clump, gDiveHier[dir], S.animFlags, S.animBlend);
         animPlayed = assoc != NULL;
     }
-    if(!animPlayed && S.fallbackJump) pad[kBtnSquare] = 255;   // tanpa IFP: lompat bawaan supaya CJ terangkat
-    { static int n = 0; if(++n <= 8) FLog("Dodge #%d arah=%d hier=%p clump=%p assoc=%p fwd=(%.2f,%.2f) massa=%.0f", n, dir, gDiveHier[dir], clump, assoc, fx, fy, mass); }
+    if(!animPlayed && S.fallbackJump) pad[kBtnSquare] = 255;   // tanpa IFP: lompat bawaan
+    { static int n = 0; if(++n <= 8) FLog("Dodge #%d arah=%d task=%d assoc=%p fwd=(%.2f,%.2f)", n, dir, (int)tasked, assoc, fx, fy); }
 
     if(S.autoBulletTime && gMeter > S.activationMin) gDiveSlow = S.diveSlow;
     return true;
@@ -390,6 +425,8 @@ static void Tick(void* ped)
         gPrevDive = down;
     }
 
+    if(gDashT > 0.0f) gDashT -= dt;
+
     // meter adrenalin
     if(BulletTimeOn())
     {
@@ -417,9 +454,20 @@ static void Tick(void* ped)
 }
 
 // ---------------------------------------------------------------- hooks
+// luncuran mendatar dodge: atur kecepatan gerak ped (CPhysical::m_vecMoveSpeed di +104) selama DashSeconds
+static void ApplyDash(void* ped)
+{
+    if(gDashT <= 0.0f || !ped) return;
+    float f = gDashT / (S.dashSeconds > 0.01f ? S.dashSeconds : 0.01f);
+    if(f > 1.0f) f = 1.0f;
+    float* ms = (float*)((uintptr_t)ped + 104);
+    ms[0] = gDashDX * S.diveForward * f;
+    ms[1] = gDashDY * S.diveForward * f;
+}
+
 static void PlayerProcess_hook(void* self)
 {
-    if(S.enabled) Tick(self);
+    if(S.enabled) { Tick(self); ApplyDash(self); }
 
     if(S.enabled && pTimeStep && gFactor > 1.001f)
     {
@@ -431,6 +479,7 @@ static void PlayerProcess_hook(void* self)
         *pTimeStep = saved;
     }
     else PlayerProcess_orig(self);
+    if(S.enabled) ApplyDash(self);
 }
 
 static void AnimUpdate_hook(void* clump, float dt, bool onScreen)
@@ -575,6 +624,9 @@ ON_MOD_LOAD()
         BlendAnimation    = (BlendAnimation_t)Sym(lib, "_ZN12CAnimManager14BlendAnimationEP7RpClumpP19CAnimBlendHierarchyif");
     }
 
+    TaskNewFn    = (TaskNew_t)Sym(lib, "_ZN5CTasknwEm");
+    RunNamedCtor = (RunNamedAnimCtor_t)Sym(lib, "_ZN23CTaskSimpleRunNamedAnimC1EPKcS1_ifibbbb");
+    SetTaskFn    = (SetTask_t)Sym(lib, "_ZN12CTaskManager7SetTaskEP5CTaskib");
     DrawRectFn = (DrawRect_t)Sym(lib, "_ZN9CSprite2d8DrawRectERK5CRectRK5CRGBA");
     pRsGlobal  = (uint8_t*)Sym(lib, "RsGlobal");
     uintptr_t playerProcess = Sym(lib, "_ZN10CPlayerPed14ProcessControlEv");
@@ -596,7 +648,7 @@ ON_MOD_LOAD()
     }
     else if(S.hydraButton) logger->Error("Tombol hidrolik di mode jalan TIDAK dipasang");
 
-    FLog("=== BulletTimeSA64 v1.6 dimulai ===");
-    logger->Info("Siap v1.6 (hook: pemain=%d anim=%d hidrolik=%d, IFP=%d)",
+    FLog("=== BulletTimeSA64 v1.7 dimulai ===");
+    logger->Info("Siap v1.7 (hook: pemain=%d anim=%d hidrolik=%d, IFP=%d)",
                  (int)(PlayerProcess_orig != NULL), (int)(AnimUpdate_orig != NULL), (int)(HydraUpdate_orig != NULL), (int)S.useIfp);
 }
