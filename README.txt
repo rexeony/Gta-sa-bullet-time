@@ -1,29 +1,11 @@
-BulletTimeSA64 - bullet time + dodge ala Max Payne untuk GTA SA Android (AML, arm64)
+BulletTimeSA64 v2.0 - bullet time untuk GTA SA Android (AML, arm64)
 
 Build: upload ke GitHub, jalankan workflow "Build BulletTimeSA64", unduh artifact.
 
 Pasang:
   libBulletTimeSA64.so -> /sdcard/Android/data/com.rockstargames.gtasa/mods/
-  BulletTime.ini       -> /sdcard/Android/data/com.rockstargames.gtasa/configs/
-  MP3SD.ifp            -> /sdcard/Android/data/com.rockstargames.gtasa/files/BulletTime/MP3SD.ifp
-                          (file animasi milik frnchise dari mod aslinya; tidak disertakan di sini)
+  BulletTime.ini       -> /sdcard/Android/data/com.rockstargames.gtasa/configs/  (hapus .ini lama dulu)
 
-Pakai:
-  Saat berjalan kaki tombol hidrolik muncul. Tap 1x = bullet time on/off. Tap 2x cepat = dodge.
-  Tidak aktif saat berkendara.
-
-Log: logcat tag "BulletTimeSA64".
+Pakai: saat jalan kaki, tap tombol hidrolik = bullet time on, tap lagi = off. Tidak aktif saat berkendara.
+Log: /sdcard/Android/data/com.rockstargames.gtasa/files/BulletTime_log.txt dan logcat tag "BulletTimeSA64".
 Terinspirasi dari "Frnchise Bullet Time" oleh frnchise; kode ditulis ulang dari nol.
-
-PENTING: kalau sebelumnya sudah pernah menjalankan versi lama, HAPUS file configs/BulletTime.ini lama
-supaya dibuat ulang dengan nilai baru.
-Kalau masih crash: set HookAnim=0, lalu HookHydra=0, lalu HookPlayer=0 satu per satu di .ini untuk
-mencari hook penyebabnya, dan kirim log "BulletTimeSA64" dari logcat.
-
-Diagnosa tombol hidrolik: mod menulis /sdcard/Android/data/com.rockstargames.gtasa/files/BulletTime_log.txt
-Jalan kaki ~10 detik, lalu naik kendaraan sebentar, lalu kirim isi file itu.
-
-v1.3: tombol hidrolik sekarang diberi alpha/enabled supaya terlihat saat jalan kaki; IFP dimuat lewat loader game.
-Kalau di HP masih ada configs/BulletTime.ini lama dengan UseIFP=0, ubah jadi UseIFP=1 atau hapus file itu.
-
-v1.4: IFP dimuat lewat stream memori RenderWare (LoadAnimFile(path) crash di port Android).
