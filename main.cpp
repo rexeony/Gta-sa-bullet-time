@@ -46,7 +46,8 @@ typedef void*  (*BlendAnimation_t)(void*, void*, int, float);
 typedef void*  (*TaskNew_t)(size_t);                                              // CTask::operator new
 typedef void   (*RunNamedAnimCtor_t)(void*, const char*, const char*, int, float, int, bool, bool, bool, bool); // CTaskSimpleRunNamedAnim::ctor
 typedef void   (*SetTask_t)(void*, void*, int, bool);
-typedef void   (*SetTaskSecondary_t)(void*, void*, int);                           // CTaskManager::SetTaskSecondary(task, slot)                              // CTaskManager::SetTask(task, slot, bool)
+typedef void   (*SetTaskSecondary_t)(void*, void*, int);
+typedef bool   (*MakeAbortable_t)(void*, void*, int, const void*);                // CTaskSimpleAnim::MakeAbortable(ped, priority, event)                           // CTaskManager::SetTaskSecondary(task, slot)                              // CTaskManager::SetTask(task, slot, bool)
 
 static GetPad_t           GetPad = NULL;
 static FindPlayerPed_t    FindPlayerPed = NULL;
@@ -65,6 +66,7 @@ static TaskNew_t          TaskNewFn = NULL;
 static RunNamedAnimCtor_t RunNamedCtor = NULL;
 static SetTask_t          SetTaskFn = NULL;
 static SetTaskSecondary_t SetTaskSecFn = NULL;
+static MakeAbortable_t    MakeAbortableFn = NULL;
 static char               gBlockName[32] = {0};
 static DrawRect_t         DrawRectFn = NULL;
 static uint8_t*           pRsGlobal = NULL;        // RsGlobal: +8 lebar layar, +12 tinggi layar
@@ -79,8 +81,8 @@ struct Settings
     bool  enabled, debugPad, holdToActivate, autoBulletTime, hydraButton, hydraDodge, useIfp;
     bool  hookPlayer, hookAnim, hookHydra, showBar, fallbackJump;
     int   hydraMode, taskFlags;
-    bool  useTask, useSecondary, freezeStick;
-    float dashSeconds, diveDuration;
+    bool  useTask, useSecondary, freezeStick, holdLastFrame;
+    float dashSeconds, diveDuration, diveAnimSpeed;
     float barX, barY, barW, barH;
     unsigned hydraFlagClear, hydraFlagSet;
     int   activateBtn, diveBtn, animFlags;
@@ -151,7 +153,9 @@ static void LoadSettings()
     S.useSecondary   = CB("AnimInSecondarySlot", true, "Dodge");   // slot sekunder (parsial): kontrol & aim pemain tetap jalan
     S.taskFlags      = (int)CF("TaskFlags", 16.0f, "Dodge");        // 16 = ANIM_FLAG_PARTIAL
     S.dashSeconds    = CF("DashSeconds", 0.6f, "Dodge");
-    S.diveDuration   = CF("DiveDuration", 1.8f, "Dodge");          // lama pose dive (detik nyata) sebelum CJ bangun
+    S.diveDuration   = CF("DiveDuration", 3.0f, "Dodge");          // batas maksimum dive (detik nyata); biasanya berakhir sendiri saat animasi selesai
+    S.holdLastFrame  = CB("HoldLastFrame", false, "Dodge");         // 1 = tahan pose terakhir sampai DiveDuration habis
+    S.diveAnimSpeed  = CF("DiveAnimSpeed", 0.55f, "Dodge");         // kecepatan animasi saat dive (lebih kecil = dive lebih lama)
     S.freezeStick    = CB("FreezeStickWhileDiving", true, "Dodge");
     S.hydraMode      = (int)CF("HydraulicsMode", 0.0f, "BulletTime"); // 0 = tap: bullet time, tap 2x: dodge | 1 = tap langsung dodge
     S.hydraDodge     = CB("HydraulicsDoubleTapDodge", true, "Dodge");
@@ -203,6 +207,7 @@ static bool  gIfpTried = false;
 static float gDashT = 0.0f, gDashDX = 0.0f, gDashDY = 0.0f;
 static float gDiveAnimT = 0.0f;
 static bool  gDiveTaskLive = false, gDiveSecondary = false;
+static void* gDiveTask = NULL;
 static void* gDiveHier[4] = { NULL, NULL, NULL, NULL };
 static const char* kDiveNames[4] = { "sd_dive_fwd", "sd_dive_bkw", "sd_dive_left", "sd_dive_right" };
 
@@ -303,18 +308,32 @@ static void LoadIfp()
     FLog("IFP: blok '%s' dimuat dari %s, %d/4 animasi dive ditemukan", blockName, path, found);
 }
 
-// Akhiri task animasi dive supaya CJ bangun dan kontrol kembali normal (tidak "stuck")
+// Task yang sekarang ada di slot dive (CTaskManager di CPedIntelligence+8: primer mulai +0, sekunder mulai +40)
+static void* DiveSlotTask(void* ped)
+{
+    if(!ped) return NULL;
+    void* intel = *(void**)((uintptr_t)ped + 1336);
+    if(!intel) return NULL;
+    uint8_t* mgr = (uint8_t*)intel + 8;
+    return gDiveSecondary ? *(void**)(mgr + 40 + 4 * 8) : *(void**)(mgr + 3 * 8);
+}
+
+// Akhiri task dive dengan benar: MakeAbortable(immediate) melepas animasi (tidak tertinggal beku), lalu slot dikosongkan
 static void EndDiveTask(void* ped)
 {
     if(!gDiveTaskLive) return;
     gDiveTaskLive = false;
     gDiveAnimT = 0.0f;
-    if(!ped) return;
+    void* task = gDiveTask;
+    gDiveTask = NULL;
+    if(!ped || !task) return;
+    if(DiveSlotTask(ped) != task) return;        // sudah selesai/dihapus game sendiri
+    if(MakeAbortableFn) MakeAbortableFn(task, ped, 2 /*immediate*/, NULL);
     void* intel = *(void**)((uintptr_t)ped + 1336);
     if(!intel) return;
     void* mgr = (uint8_t*)intel + 8;
-    if(gDiveSecondary && SetTaskSecFn) SetTaskSecFn(mgr, NULL, 4);      // TASK_SECONDARY_PARTIAL_ANIM
-    else if(SetTaskFn) SetTaskFn(mgr, NULL, 3, false);                  // TASK_PRIMARY_PRIMARY
+    if(gDiveSecondary && SetTaskSecFn) SetTaskSecFn(mgr, NULL, 4);
+    else if(SetTaskFn) SetTaskFn(mgr, NULL, 3, false);
 }
 
 static bool DoDodge(void* ped, int16_t* pad)
@@ -364,10 +383,11 @@ static bool DoDodge(void* ped, int16_t* pad)
         if(t)
         {
             // endTime=-1: diakhiri oleh mod sesudah DiveDuration; bHoldLastFrame=true menahan pose dive
-            RunNamedCtor(t, kDiveNames[dir], gBlockName, S.taskFlags, S.animBlend, -1, false, false, false, true);
+            RunNamedCtor(t, kDiveNames[dir], gBlockName, S.taskFlags, S.animBlend, -1, false, false, false, S.holdLastFrame);
             void* mgr = (uint8_t*)intel + 8;
             if(S.useSecondary && SetTaskSecFn) { SetTaskSecFn(mgr, t, 4); gDiveSecondary = true; }
             else if(SetTaskFn) { SetTaskFn(mgr, t, 3, false); gDiveSecondary = false; }
+            gDiveTask = t;
             gDiveTaskLive = true;
             gDiveAnimT = S.diveDuration;
             tasked = true;
@@ -457,8 +477,17 @@ static void Tick(void* ped)
     if(gDiveTaskLive)
     {
         gDiveAnimT -= dt;
-        if(pad && S.freezeStick) { pad[0] = 0; pad[1] = 0; }   // CJ tidak berjalan sendiri selama pose dive
-        if(gDiveAnimT <= 0.0f) EndDiveTask(ped);
+        if(DiveSlotTask(ped) != gDiveTask)
+        {
+            // animasi selesai dan game sudah membuang task-nya: kontrol langsung normal lagi
+            gDiveTaskLive = false; gDiveTask = NULL; gDiveAnimT = 0.0f;
+            static int en = 0; if(++en <= 8) FLog("Dive selesai (task habis sendiri)");
+        }
+        else
+        {
+            if(pad && S.freezeStick) { pad[0] = 0; pad[1] = 0; }   // CJ tidak berjalan sendiri selama animasi dive
+            if(gDiveAnimT <= 0.0f) { static int tn2 = 0; if(++tn2 <= 8) FLog("Dive dihentikan paksa (batas waktu)"); EndDiveTask(ped); }
+        }
     }
 
     // meter adrenalin
@@ -518,10 +547,14 @@ static void PlayerProcess_hook(void* self)
 
 static void AnimUpdate_hook(void* clump, float dt, bool onScreen)
 {
-    if(S.enabled && gFactor > 1.001f && !gInPlayerProcess && clump && FindPlayerPed)
+    if(S.enabled && (gFactor > 1.001f || gDiveTaskLive) && clump && FindPlayerPed)
     {
         void* ped = FindPlayerPed(0);
-        if(ped && clump == *(void**)((uintptr_t)ped + 0x20)) dt *= gFactor;
+        if(ped && clump == *(void**)((uintptr_t)ped + 0x20))
+        {
+            if(gFactor > 1.001f && !gInPlayerProcess) dt *= gFactor;
+            if(gDiveTaskLive) dt *= S.diveAnimSpeed;          // dive lebih lambat = lebih lama
+        }
     }
     AnimUpdate_orig(clump, dt, onScreen);
 }
@@ -662,6 +695,7 @@ ON_MOD_LOAD()
     RunNamedCtor = (RunNamedAnimCtor_t)Sym(lib, "_ZN23CTaskSimpleRunNamedAnimC1EPKcS1_ifibbbb");
     SetTaskFn    = (SetTask_t)Sym(lib, "_ZN12CTaskManager7SetTaskEP5CTaskib");
     SetTaskSecFn = (SetTaskSecondary_t)Sym(lib, "_ZN12CTaskManager16SetTaskSecondaryEP5CTaski");
+    MakeAbortableFn = (MakeAbortable_t)Sym(lib, "_ZN15CTaskSimpleAnim13MakeAbortableEP4CPediPK6CEvent");
     DrawRectFn = (DrawRect_t)Sym(lib, "_ZN9CSprite2d8DrawRectERK5CRectRK5CRGBA");
     pRsGlobal  = (uint8_t*)Sym(lib, "RsGlobal");
     uintptr_t playerProcess = Sym(lib, "_ZN10CPlayerPed14ProcessControlEv");
@@ -683,7 +717,7 @@ ON_MOD_LOAD()
     }
     else if(S.hydraButton) logger->Error("Tombol hidrolik di mode jalan TIDAK dipasang");
 
-    FLog("=== BulletTimeSA64 v1.8 dimulai ===");
-    logger->Info("Siap v1.8 (hook: pemain=%d anim=%d hidrolik=%d, IFP=%d)",
+    FLog("=== BulletTimeSA64 v1.9 dimulai ===");
+    logger->Info("Siap v1.9 (hook: pemain=%d anim=%d hidrolik=%d, IFP=%d)",
                  (int)(PlayerProcess_orig != NULL), (int)(AnimUpdate_orig != NULL), (int)(HydraUpdate_orig != NULL), (int)S.useIfp);
 }
