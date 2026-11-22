@@ -1,541 +1,777 @@
-// BulletTimeSA64 v2.0 - Bullet Time + Dodge (shootdodge) untuk GTA SA Android (arm64, AML)
-// Pemicu: tombol hidrolik (widget sentuh) saat jalan kaki.
-//   1x tap  = bullet time on/off
-//   2x tap  = dodge (animasi dari MP3SD.ifp, varian 1 tangan / 2 tangan / dual)
-// Ada bar adrenalin: terkuras saat bullet time, terisi saat menunggu atau saat membunuh.
+// Bullet Time + Dodge for GTA San Andreas Android (AML, arm64-v8a)
+// Ide: Max Payne (bullet time + shootdodge). Dibuat ulang dari nol, bukan port dari mod PC.
+// Terinspirasi dari "Frnchise Bullet Time" oleh frnchise.
 //
-// Dodge bisa dilakukan sambil bidik & tembak; kalau belum bidik, otomatis masuk mode bidik saat melayang.
-// Semua offset struct diambil dari disassembly libGTASA.so arm64 (lihat README.md).
+// Semua alamat game dicari lewat NAMA SIMBOL di libGTASA.so (tanpa offset hardcode).
+// Hook hanya dipasang pada fungsi yang awalnya aman (tanpa instruksi PC-relatif di 5 instruksi pertama):
+//   CPlayerPed::ProcessControl, RpAnimBlendClumpUpdateAnimations, CWidgetButtonHydraulics::Update
+
 #include <mod/amlmod.h>
 #include <mod/logger.h>
 #include <mod/config.h>
-#include <mod/flogger.h>
-#include <time.h>
-#include <stdint.h>
-#include <stdio.h>
-#include <string.h>
 #include <math.h>
+#include <stdint.h>
+#include <string.h>
+#include <strings.h>
+#include <time.h>
+#include <stdio.h>
+#include <stdlib.h>
+#include <stdarg.h>
 
-MYMODCFGNAME(net.hafizdms.sabullettime, Bullet Time Dodge, 2.0, hafizdMS/zidanaSQ, BulletTime)
+MYMODCFGNAME(net.hafizdms.sabullettime, Bullet Time Dodge, 1.2, hafizdMS/zidanaSQ, BulletTime)
 NEEDGAME(com.rockstargames.gtasa)
 
-static FLogger flog("BulletTime_log.txt");
+// ---------------------------------------------------------------- game symbols
+struct CVector { float x, y, z; };
+typedef void*  (*GetPad_t)(int);
+typedef void*  (*FindPlayerPed_t)(int);
+typedef void*  (*FindPlayerVehicle_t)(int, bool);
+typedef void   (*ApplyMoveForce_t)(void*, CVector);     // CVector lewat register s0-s2
+typedef void   (*PedProcess_t)(void*);
+typedef void   (*AnimUpdate_t)(void*, float, bool);
+typedef void   (*HydraUpdate_t)(void*);
+typedef void   (*HydraDraw_t)(void*);
+typedef bool   (*WidgetIsTouched_t)(void*, void*);      // virtual CWidget::IsTouched(CVector2D*) (vtable +160)
+typedef void*  (*GetAnimationBlock_t)(const char*);
+typedef void*  (*RegisterAnimBlock_t)(const char*);
+struct RwMemory { uint8_t* start; uint32_t length; };
+struct CRect { float left, bottom, right, top; };      // bottom = y lebih besar (layar y ke bawah)
+struct CRGBA { uint8_t r, g, b, a; };
+typedef void   (*DrawRect_t)(const CRect&, const CRGBA&); // CSprite2d::DrawRect
+typedef void*  (*RwStreamOpen_t)(int, int, const void*);   // RwStreamOpen(type, access, data)
+typedef int    (*RwStreamClose_t)(void*, void*);           // RwStreamClose(stream, data)
+typedef void   (*LoadAnimFile_t)(void*, bool, const char (*)[32]); // CAnimManager::LoadAnimFile(RwStream*, bool, ...)
+typedef void*  (*GetAnimation_t)(const char*, const void*);
+typedef void*  (*BlendAnimation_t)(void*, void*, int, float);
+typedef void*  (*TaskNew_t)(size_t);                                              // CTask::operator new
+typedef void   (*RunNamedAnimCtor_t)(void*, const char*, const char*, int, float, int, bool, bool, bool, bool); // CTaskSimpleRunNamedAnim::ctor
+typedef void   (*SetTask_t)(void*, void*, int, bool);
+typedef void   (*SetTaskSecondary_t)(void*, void*, int);
+typedef bool   (*MakeAbortable_t)(void*, void*, int, const void*);
+typedef bool   (*PadBool_t)(void*);                 // CPad::GetEnterTargeting() / GetExitTargeting()
+typedef bool   (*PadTarget_t)(void*, bool);         // CPad::GetTarget(bool)                // CTaskSimpleAnim::MakeAbortable(ped, priority, event)                           // CTaskManager::SetTaskSecondary(task, slot)                              // CTaskManager::SetTask(task, slot, bool)
 
-// ------------------------------------------------------------------ tipe & offset
-struct V2 { float x, y; };
-struct RectF { float x1, y1, x2, y2; };
-struct Rgba { uint8_t r, g, b, a; };
-struct RwMemoryT { uint8_t* start; uint32_t length; };
+static GetPad_t           GetPad = NULL;
+static FindPlayerPed_t    FindPlayerPed = NULL;
+static FindPlayerVehicle_t FindPlayerVehicle = NULL;
+static ApplyMoveForce_t   ApplyMoveForce = NULL;
+static float*             pTimeScale = NULL;      // CTimer::ms_fTimeScale
+static float*             pTimeStep = NULL;       // CTimer::ms_fTimeStep
+static PedProcess_t       PlayerProcess_orig = NULL;
+static AnimUpdate_t       AnimUpdate_orig = NULL;
+static HydraUpdate_t      HydraUpdate_orig = NULL;
+static HydraDraw_t        HydraDraw_orig = NULL;
+static GetAnimationBlock_t GetAnimationBlock = NULL;
+static RegisterAnimBlock_t RegisterAnimBlock = NULL;
+static LoadAnimFile_t     LoadAnimFile = NULL;
+static TaskNew_t          TaskNewFn = NULL;
+static RunNamedAnimCtor_t RunNamedCtor = NULL;
+static SetTask_t          SetTaskFn = NULL;
+static SetTaskSecondary_t SetTaskSecFn = NULL;
+static MakeAbortable_t    MakeAbortableFn = NULL;
+static PadBool_t          EnterT_orig = NULL, ExitT_orig = NULL;
+static PadTarget_t        Target_orig = NULL;
+static char               gBlockName[32] = {0};
+static DrawRect_t         DrawRectFn = NULL;
+static uint8_t*           pRsGlobal = NULL;        // RsGlobal: +8 lebar layar, +12 tinggi layar
+static RwStreamOpen_t     RwStreamOpenFn = NULL;
+static RwStreamClose_t    RwStreamCloseFn = NULL;
+static GetAnimation_t     GetAnimationFn = NULL;
+static BlendAnimation_t   BlendAnimation = NULL;
 
-enum { OFF_ENT_MATRIX = 0x18, OFF_ENT_CLUMP = 0x20, OFF_PHYS_MOVESPEED = 0x68,
-       OFF_PED_HEALTH = 0x6AC, OFF_PED_WEAPONS = 0x730, OFF_PED_ACTIVESLOT = 0x8DC,
-       WEAPON_STRIDE = 0x20,
-       OFF_PAD_DISABLED = 0x110,
-       OFF_W_HID = 0x08, OFF_W_ENABLED = 0x59, OFF_W_SHOWN = 0xC9, OFF_W_HILITE = 0xC8,
-       OFF_ASSOC_BLEND = 0x30, OFF_ASSOC_SPEED = 0x3C, OFF_ASSOC_FLAGS = 0x46 };
-
-// ------------------------------------------------------------------ fungsi game
-static void* (*FindPlayerPed)(int);
-static void* (*FindPlayerVehicle)(int, bool);
-static void* (*GetPad)(int);
-static int16_t (*PadWalkLR)(void*);
-static int16_t (*PadWalkUD)(void*);
-static bool (*PedInControl)(void*);
-static int8_t (*PedWeaponSkill)(void*, int);
-static void (*LoadAnimFileStream)(void*, bool, void*);
-static void* (*RwStreamOpenF)(int, int, const void*);
-static int (*RwStreamCloseF)(void*, void*);
-static void* (*GetAnimBlock)(const char*);
-static int (*GetAnimBlockIndex)(const char*);
-static void (*AddAnimBlockRef)(int);
-static void* (*GetAnim)(const char*, const void*);
-static void* (*FindActiveTask)(void*, int);
-static void* (*BlendAnim)(void*, void*, int, float);
-static void (*AssocSetFinishCB)(void*, void (*)(void*, void*), void*);
-static void (*AssocSetDeleteCB)(void*, void (*)(void*, void*), void*);
-static bool (*IsTouchDown)(int);
-static V2 (*GetTouchPos)(int);
-static bool (*HidImplements)(int);
-static bool (*HidIsPressed)(int, float*);
-static void (*DrawRectXLU)(const RectF&, const Rgba&, const Rgba&, const Rgba&, const Rgba&);
-static int (*ScreenW)();
-static int (*ScreenH)();
-static float* pTimeScale; static float* pTimeStep;
-static uint8_t* pUserPause; static uint8_t* pCodePause;
-static int* pMaxTouches;
-
-// ------------------------------------------------------------------ konfigurasi
-struct Cfg {
-    bool enabled, hydraOnFoot, doubleTapDodge, autoBT, useIFP, useGamepad, lockDive, aimDive, autoFire;
-    float worldSpeed, cjSpeed, blendIn, blendOut, duration, refill, startMeter, actMin;
-    float killRefill, dodgeCost, diveSpeed, diveUp, diveMove, diveSlow, tapWindow, animBlend, animSpeed;
+// ---------------------------------------------------------------- settings
+struct Settings
+{
+    bool  enabled, debugPad, holdToActivate, autoBulletTime, hydraButton, hydraDodge, useIfp;
+    bool  hookPlayer, hookAnim, hookHydra, showBar, fallbackJump;
+    int   hydraMode, taskFlags;
+    bool  useTask, useSecondary, freezeStick, holdLastFrame, forceAim, logAim, hookTarget, hookAimEnter, hookAimExit;
+    float dashSeconds, diveDuration, diveAnimSpeed;
     float barX, barY, barW, barH;
-    bool hookPlayer, hookAnim, hookHydra, hookKill, hookAim;
-    char ifpPath[400];
-} C;
+    unsigned hydraFlagClear, hydraFlagSet;
+    int   activateBtn, diveBtn, animFlags;
+    float animBlend, cjSpeed, worldSpeed, blendIn, blendOut, duration, refill, startMeter, activationMin;
+    float tapWindow, diveForward, diveUp, diveSlow;
+    char  ifpPath[400];
+} S;
 
-static float CF(const char* s, const char* k, float d) { ConfigEntry* e = cfg->Bind(k, d, s); float v = e->GetFloat(); delete e; return v; }
-static bool  CB(const char* s, const char* k, bool d)  { ConfigEntry* e = cfg->Bind(k, d, s); bool v = e->GetBool(); delete e; return v; }
+static const char* kPadNames[] = {
+    "LeftStickX", "LeftStickY", "RightStickX", "RightStickY",
+    "LeftShoulder1", "LeftShoulder2", "RightShoulder1", "RightShoulder2",
+    "DPadUp", "DPadDown", "DPadLeft", "DPadRight",
+    "Start", "Select", "ButtonSquare", "ButtonTriangle",
+    "ButtonCross", "ButtonCircle", "ShockButtonL", "ShockButtonR"
+};
+static const int kPadCount = 20;
+static const int kBtnSquare = 14;
 
-static void LoadCfg() {
-    C.enabled = CB("Main", "Enabled", true);
-    C.hookPlayer = CB("Debug", "HookPlayer", true);
-    C.hookAnim = CB("Debug", "HookAnim", true);
-    C.hookHydra = CB("Debug", "HookHydra", true);
-    C.hookKill = CB("Debug", "HookKill", false);
-    C.hookAim = CB("Debug", "HookAim", true);
-    C.hydraOnFoot = CB("BulletTime", "HydraulicsButtonOnFoot", true);
-    C.useGamepad = CB("BulletTime", "UseGamepadMapping", true);
-    C.worldSpeed = CF("BulletTime", "WorldSpeed", 0.35f);
-    C.cjSpeed = CF("BulletTime", "CJSpeed", 0.6f);
-    C.blendIn = CF("BulletTime", "BlendIn", 0.12f);
-    C.blendOut = CF("BulletTime", "BlendOut", 0.25f);
-    C.duration = CF("BulletTime", "Duration", 14.0f);
-    C.refill = CF("BulletTime", "RefillPerSec", 0.04f);
-    C.startMeter = CF("BulletTime", "StartMeter", 1.0f);
-    C.actMin = CF("BulletTime", "ActivationMinimum", 0.05f);
-    C.killRefill = CF("BulletTime", "KillRefill", 0.0f);
-    C.doubleTapDodge = CB("Dodge", "HydraulicsDoubleTapDodge", true);
-    C.tapWindow = CF("Dodge", "DoubleTapWindow", 0.35f);
-    C.dodgeCost = CF("Dodge", "DodgeCost", 0.15f);
-    C.diveSpeed = CF("Dodge", "DiveSpeed", 0.30f);
-    C.diveUp = CF("Dodge", "DiveUpSpeed", 0.0f);
-    C.diveMove = CF("Dodge", "DiveMoveSeconds", 0.9f);
-    C.autoBT = CB("Dodge", "AutoBulletTime", true);
-    C.diveSlow = CF("Dodge", "DiveSlowSeconds", 2.5f);
-    C.useIFP = CB("Dodge", "UseIFP", true);
-    C.lockDive = CB("Dodge", "LockControlsDuringDive", false);
-    C.aimDive = CB("Dodge", "AimDuringDive", true);
-    C.autoFire = CB("Dodge", "AutoFireDuringDive", false);
-    C.animBlend = CF("Dodge", "AnimBlend", 8.0f);
-    C.animSpeed = CF("Dodge", "AnimSpeed", 1.0f);
-    C.barX = CF("Bar", "X", 0.30f); C.barY = CF("Bar", "Y", 0.93f);
-    C.barW = CF("Bar", "Width", 0.40f); C.barH = CF("Bar", "Height", 0.018f);
-    ConfigEntry* e = cfg->Bind("IFPPath", "", "Dodge");
-    e->GetString(C.ifpPath, sizeof(C.ifpPath));
-    delete e;
-    if (C.worldSpeed < 0.05f) C.worldSpeed = 0.05f;
-    if (C.worldSpeed > 0.99f) C.worldSpeed = 0.99f;
-    if (C.duration < 1.0f) C.duration = 1.0f;
-    if (C.blendIn < 0.01f) C.blendIn = 0.01f;
-    if (C.blendOut < 0.01f) C.blendOut = 0.01f;
+static int PadIndex(const char* name)
+{
+    for(int i = 4; i < kPadCount; ++i) if(!strcasecmp(name, kPadNames[i])) return i;
+    return -1;
+}
+
+static float CF(const char* k, float d, const char* s) { ConfigEntry* e = cfg->Bind(k, d, s); float v = e ? e->GetFloat() : d; cfg->ClearLast(); return v; }
+static bool  CB(const char* k, bool d, const char* s)  { ConfigEntry* e = cfg->Bind(k, d, s); bool v = e ? e->GetBool() : d;   cfg->ClearLast(); return v; }
+static void  CS(const char* k, const char* d, const char* s, char* out, size_t n)
+{
+    ConfigEntry* e = cfg->Bind(k, d, s);
+    strncpy(out, e ? e->GetString() : d, n - 1); out[n - 1] = 0;
+    cfg->ClearLast();
+}
+static int CPadBtn(const char* k, const char* d, const char* s)
+{
+    char buf[64]; CS(k, d, s, buf, sizeof(buf));
+    return PadIndex(buf);
+}
+
+static void LoadSettings()
+{
+    S.enabled        = CB("Enabled", true, "Main");
+    S.debugPad       = CB("DebugPad", false, "Main");
+    S.hookPlayer     = CB("HookPlayer", true, "Debug");
+    S.hookAnim       = CB("HookAnim", true, "Debug");
+    S.hookHydra      = CB("HookHydra", true, "Debug");
+    S.hydraFlagClear = (unsigned)CF("HydraFlagClear", 4.0f, "Debug");   // bit flag widget (+140) yang dihapus saat jalan kaki
+    S.hydraFlagSet   = (unsigned)CF("HydraFlagSet", 0.0f, "Debug");     // bit flag widget yang ditambahkan saat jalan kaki
+
+    S.hydraButton    = CB("HydraulicsButtonOnFoot", true, "BulletTime");
+    S.activateBtn    = CPadBtn("ActivateButton", "None", "BulletTime");
+    S.holdToActivate = CB("HoldToActivate", false, "BulletTime");
+    S.worldSpeed     = CF("WorldSpeed", 0.35f, "BulletTime");
+    S.cjSpeed        = CF("CJSpeed", 0.6f, "BulletTime");
+    S.blendIn        = CF("BlendIn", 0.12f, "BulletTime");
+    S.blendOut       = CF("BlendOut", 0.25f, "BulletTime");
+    S.duration       = CF("Duration", 14.0f, "BulletTime");
+    S.refill         = CF("RefillPerSec", 0.04f, "BulletTime");
+    S.startMeter     = CF("StartMeter", 1.0f, "BulletTime");
+    S.activationMin  = CF("ActivationMinimum", 0.05f, "BulletTime");
+
+    S.showBar        = CB("ShowBar", true, "Bar");
+    S.barX           = CF("BarX", 0.35f, "Bar");      // posisi kiri bar (pecahan lebar layar)
+    S.barY           = CF("BarY", 0.04f, "Bar");      // posisi atas bar (pecahan tinggi layar)
+    S.barW           = CF("BarWidth", 0.30f, "Bar");
+    S.barH           = CF("BarHeight", 0.022f, "Bar");
+    S.fallbackJump   = CB("FallbackJump", true, "Dodge");
+    S.forceAim       = CB("ForceAimWhileDiving", true, "Aim");     // paksa mode bidik selama dive
+    S.logAim         = CB("LogAim", true, "Aim");                  // catat perubahan status aim ke log
+    S.hookTarget     = CB("HookGetTarget", true, "Aim");
+    S.hookAimEnter   = CB("HookGetEnterTargeting", false, "Aim");  // opsional (uji bertahap)
+    S.hookAimExit    = CB("HookGetExitTargeting", false, "Aim");   // opsional (uji bertahap)
+    S.useTask        = CB("UseAnimTask", true, "Dodge");          // main animasi lewat task bawaan game (tidak ditimpa)
+    S.useSecondary   = CB("AnimInSecondarySlot", true, "Dodge");   // slot sekunder (parsial): kontrol & aim pemain tetap jalan
+    S.taskFlags      = (int)CF("TaskFlags", 16.0f, "Dodge");        // 16 = ANIM_FLAG_PARTIAL
+    S.dashSeconds    = CF("DashSeconds", 0.6f, "Dodge");
+    S.diveDuration   = CF("DiveDuration", 3.0f, "Dodge");          // batas maksimum dive (detik nyata); biasanya berakhir sendiri saat animasi selesai
+    S.holdLastFrame  = CB("HoldLastFrame", false, "Dodge");         // 1 = tahan pose terakhir sampai DiveDuration habis
+    S.diveAnimSpeed  = CF("DiveAnimSpeed", 0.55f, "Dodge");         // kecepatan animasi saat dive (lebih kecil = dive lebih lama)
+    S.freezeStick    = CB("FreezeStickWhileDiving", true, "Dodge");
+    S.hydraMode      = (int)CF("HydraulicsMode", 0.0f, "BulletTime"); // 0 = tap: bullet time, tap 2x: dodge | 1 = tap langsung dodge
+    S.hydraDodge     = CB("HydraulicsDoubleTapDodge", true, "Dodge");
+    S.tapWindow      = CF("DoubleTapWindow", 0.5f, "Dodge");
+    S.diveBtn        = CPadBtn("DiveButton", "None", "Dodge");
+    S.diveForward    = CF("DiveSpeed", 0.16f, "Dodge");
+    S.diveUp         = CF("DiveUpSpeed", 0.0f, "Dodge");
+    S.autoBulletTime = CB("AutoBulletTime", true, "Dodge");
+    S.diveSlow       = CF("DiveSlowSeconds", 2.5f, "Dodge");
+    S.useIfp         = CB("UseIFP", true, "Dodge");
+    CS("IFPPath", "", "Dodge", S.ifpPath, sizeof(S.ifpPath));
+    S.animFlags      = (int)CF("AnimFlags", 0.0f, "Dodge");
+    S.animBlend      = CF("AnimBlend", 8.0f, "Dodge");
     cfg->Save();
+
+    if(S.worldSpeed < 0.05f) S.worldSpeed = 0.05f;
+    if(S.worldSpeed > 1.0f)  S.worldSpeed = 1.0f;
+    if(S.cjSpeed < 0.05f) S.cjSpeed = 0.05f;
+    if(S.cjSpeed > 1.0f)  S.cjSpeed = 1.0f;
+    if(S.blendIn  < 0.01f) S.blendIn  = 0.01f;
+    if(S.blendOut < 0.01f) S.blendOut = 0.01f;
+    if(S.duration < 1.0f)  S.duration = 1.0f;
 }
 
-// ------------------------------------------------------------------ state
-enum { DIR_FWD, DIR_BKW, DIR_LEFT, DIR_RIGHT };
-enum { VAR_1H, VAR_2H, VAR_DUAL };
-
-static struct State {
-    double lastT = 0; long frames = 0;
-    bool bt = false; float meter = 1.0f; float scale = 1.0f; bool scaleDirty = false;
-    // input dari widget
-    bool pressPrev = false, evTap = false; double lastTapT = -100; bool pendingOff = false; double pendingOffT = 0;
-    // dodge
-    bool diving = false; double diveStart = 0; float dirX = 0, dirY = 0; bool upDone = false;
-    void* assoc = nullptr; bool assocAlive = false; double diveSlowUntil = 0;
-    // ifp
-    bool ifpTried = false, ifpOk = false; void* hier[4][3] = {{0}};
-    // kill
-    void* lastVictim = nullptr; double lastKillT = -10;
-    bool inScaled = false; long logCount = 0; bool loggedFoot = false;
-} g;
-
-static double Now() { timespec ts; clock_gettime(CLOCK_MONOTONIC, &ts); return ts.tv_sec + ts.tv_nsec * 1e-9; }
-static inline uint8_t* U8(void* p, int off) { return (uint8_t*)p + off; }
-static inline float* F32(void* p, int off) { return (float*)((uint8_t*)p + off); }
-
-static void Log(const char* fmt, ...) __attribute__((format(printf, 1, 2)));
-static void Log(const char* fmt, ...) {
-    if (g.logCount++ > 400) return;
-    char b[512]; va_list a; va_start(a, fmt); vsnprintf(b, sizeof(b), fmt, a); va_end(a);
-    flog.Write("%s", b);
+// log ke file (mudah dikirim): <AndroidData>/BulletTime_log.txt
+static void FLog(const char* fmt, ...)
+{
+    char msg[300];
+    va_list ap; va_start(ap, fmt); vsnprintf(msg, sizeof(msg), fmt, ap); va_end(ap);
+    logger->Info("%s", msg);
+    char path[500]; snprintf(path, sizeof(path), "%s/BulletTime_log.txt", aml->GetAndroidDataPath());
+    FILE* f = fopen(path, "a");
+    if(f) { fprintf(f, "%s\n", msg); fclose(f); }
 }
 
-static bool OnFoot(void** pedOut = nullptr) {
-    void* ped = FindPlayerPed ? FindPlayerPed(-1) : nullptr;
-    if (pedOut) *pedOut = ped;
-    if (!ped) return false;
-    if (*F32(ped, OFF_PED_HEALTH) <= 0.0f) return false;
-    return FindPlayerVehicle(-1, false) == nullptr;
+// ---------------------------------------------------------------- state
+static float gMeter = 1.0f;
+static float gScale = 1.0f;          // time scale milik mod yang sedang dipakai
+static float gFactor = 1.0f;         // pengali kecepatan CJ relatif terhadap dunia (>=1)
+static bool  gInPlayerProcess = false;
+static bool  gManual = false;
+static float gDiveSlow = 0.0f;
+static bool  gHydraPrev = false, gHydraTap = false, gHydraLogged = false;
+static double gHydraLast = -10.0;
+static float gLastTap = -10.0f;
+static bool  gPrevActivate = false, gPrevDive = false;
+static int16_t gPrevPad[20];
+static bool  gIfpTried = false;
+static float gDashT = 0.0f, gDashDX = 0.0f, gDashDY = 0.0f;
+static float gDiveAnimT = 0.0f;
+static bool  gDiveTaskLive = false, gDiveSecondary = false;
+static void* gDiveTask = NULL;
+static float gAimKickT = 0.0f;
+static int   gAimLogN = 0, gLastTargetReal = -1;
+static void* gDiveHier[4] = { NULL, NULL, NULL, NULL };
+static const char* kDiveNames[4] = { "sd_dive_fwd", "sd_dive_bkw", "sd_dive_left", "sd_dive_right" };
+
+static double RealNow()
+{
+    timespec ts; clock_gettime(CLOCK_MONOTONIC, &ts);
+    return (double)ts.tv_sec + (double)ts.tv_nsec * 1e-9;
 }
-static bool PadLocked() { void* p = GetPad(0); return !p || *(uint16_t*)U8(p, OFF_PAD_DISABLED) != 0; }
 
-// ------------------------------------------------------------------ IFP
-static const char* kDirName[4] = { "fwd", "bkw", "left", "right" };
-static const char* kVarSuffix[3] = { "", "_2h", "_dual" };
+static float RealDelta()
+{
+    static double last = 0.0;
+    double now = RealNow();
+    float dt = last > 0.0 ? (float)(now - last) : 0.016f;
+    last = now;
+    if(dt < 0.0f) dt = 0.0f;
+    if(dt > 0.1f) dt = 0.1f;
+    return dt;
+}
 
-static void DiveFinishCB(void*, void*) { g.assocAlive = false; g.assoc = nullptr; }
+static inline bool BulletTimeOn() { return gManual || gDiveSlow > 0.0f; }
 
-static bool TryLoadIFPFile(const char* path) {
-    FILE* f = fopen(path, "rb");
-    if (!f) return false;
-    fseek(f, 0, SEEK_END); long len = ftell(f); fseek(f, 0, SEEK_SET);
-    if (len < 64 || len > 16 * 1024 * 1024) { fclose(f); return false; }
-    uint8_t* buf = (uint8_t*)malloc(len);
-    if (!buf || fread(buf, 1, len, f) != (size_t)len) { fclose(f); free(buf); return false; }
-    fclose(f);
-    if (memcmp(buf, "ANP3", 4) != 0 && memcmp(buf, "ANP2", 4) != 0) { Log("IFP bukan ANP2/ANP3: %s", path); free(buf); return false; }
-    char name[25]; memcpy(name, buf + 8, 24); name[24] = 0;
-    RwMemoryT mem = { buf, (uint32_t)len };
-    void* st = RwStreamOpenF(3 /*memory*/, 1 /*read*/, &mem);
-    if (!st) { Log("RwStreamOpen gagal"); free(buf); return false; }
-    LoadAnimFileStream(st, true, nullptr);
-    RwMemoryT dummy = { nullptr, 0 };
-    RwStreamCloseF(st, &dummy);
-    free(buf);
-    void* blk = GetAnimBlock(name);
-    if (!blk) { Log("Blok animasi '%s' tidak terdaftar setelah load", name); return false; }
-    int idx = GetAnimBlockIndex(name);
-    if (idx >= 0) AddAnimBlockRef(idx); // jaga supaya blok tidak dibuang game
-    int found = 0;
-    for (int d = 0; d < 4; d++) for (int v = 0; v < 3; v++) {
-        char an[48]; snprintf(an, sizeof(an), "sd_dive_%s%s", kDirName[d], kVarSuffix[v]);
-        g.hier[d][v] = GetAnim(an, blk);
-        if (g.hier[d][v]) found++; else Log("Animasi tidak ada: %s", an);
+// ---------------------------------------------------------------- dodge
+// Layout arm64 (diturunkan dari disassembly libGTASA.so):
+//   CEntity: +0x08 m_placement{pos, heading(+0x14)}, +0x18 m_matrix*, +0x20 m_pRwObject (clump)
+//   CPhysical: +104 m_vecMoveSpeed, +176 m_fMass
+static bool GetPedForward(void* ped, float& fx, float& fy)
+{
+    uintptr_t base = (uintptr_t)ped;
+    void* mat = *(void**)(base + 0x18);
+    if(mat)
+    {
+        const float* m = (const float*)mat;
+        fx = m[4]; fy = m[5];
+        float len = sqrtf(fx * fx + fy * fy);
+        if(len > 0.5f && len < 1.5f) { fx /= len; fy /= len; return true; }
     }
-    Log("IFP dimuat dari %s (blok '%s'), %d/12 animasi dodge ketemu", path, name, found);
-    return found > 0;
-}
-
-static void LoadIFP() {
-    g.ifpTried = true;
-    if (!C.useIFP) { Log("UseIFP=0, dodge tanpa animasi IFP"); return; }
-    char p[600];
-    const char* data = aml->GetAndroidDataPath();
-    const char* cands[4] = { C.ifpPath, nullptr, nullptr, nullptr };
-    char c1[600], c2[600], c3[600];
-    snprintf(c1, sizeof(c1), "%s/BulletTime/MP3SD.ifp", data); cands[1] = c1;
-    snprintf(c2, sizeof(c2), "%s/MP3SD.ifp", data); cands[2] = c2;
-    snprintf(c3, sizeof(c3), "%s/BulletTime/MP3SD.ifp", aml->GetConfigPath()); cands[3] = c3;
-    for (int i = 0; i < 4; i++) {
-        if (!cands[i] || !cands[i][0]) continue;
-        snprintf(p, sizeof(p), "%s", cands[i]);
-        if (TryLoadIFPFile(p)) { g.ifpOk = true; return; }
-    }
-    Log("MP3SD.ifp tidak ditemukan/gagal dimuat. Taruh di: %s/BulletTime/MP3SD.ifp", data);
-}
-
-// ------------------------------------------------------------------ bullet time & dodge
-static void StartBT() { g.bt = true; g.pendingOff = false; Log("Bullet time ON (meter=%.2f)", g.meter); }
-static void StopBT()  { g.bt = false; g.pendingOff = false; Log("Bullet time OFF (meter=%.2f)", g.meter); }
-
-static int WeaponVariant(void* ped) {
-    int slot = *(int8_t*)U8(ped, OFF_PED_ACTIVESLOT);
-    if (slot < 0 || slot > 12) return VAR_1H;
-    int type = *(int*)U8(ped, OFF_PED_WEAPONS + slot * WEAPON_STRIDE);
-    switch (type) {
-        case 25: case 26: case 27: case 29: case 30: case 31: case 33: case 34:
-        case 35: case 36: case 37: case 38: return VAR_2H;
-        case 22: case 28: case 32:
-            return (PedWeaponSkill(ped, type) >= 2) ? VAR_DUAL : VAR_1H;
-        default: return VAR_1H;
-    }
-}
-
-static bool HasGun(void* ped) {
-    int slot = *(int8_t*)U8(ped, OFF_PED_ACTIVESLOT);
-    if (slot < 0 || slot > 12) return false;
-    int type = *(int*)U8(ped, OFF_PED_WEAPONS + slot * WEAPON_STRIDE);
-    return type >= 22 && type <= 34;
-}
-static bool IsAiming(void* ped) {
-    void* mgr = *(void**)U8(ped, 0x538); // CTaskManager, task 0x133 = sedang mengarahkan senjata
-    return mgr && FindActiveTask(U8(mgr, 8), 0x133) != nullptr;
-}
-
-static void TryDodge(double now) {
-    void* ped; if (!OnFoot(&ped) || g.diving || PadLocked()) return;
-    if (!PedInControl(ped)) return;
-    if (g.meter < C.dodgeCost) { Log("Dodge ditolak: meter %.2f < %.2f", g.meter, C.dodgeCost); return; }
-    void* pad = GetPad(0);
-    int lr = PadWalkLR(pad), ud = PadWalkUD(pad);
-    int dir = DIR_FWD;
-    if (abs(lr) > abs(ud) && abs(lr) > 40) dir = lr < 0 ? DIR_LEFT : DIR_RIGHT;
-    else if (ud > 40) dir = DIR_BKW;
-    int var = WeaponVariant(ped);
-    float* m = *(float**)U8(ped, OFF_ENT_MATRIX);
-    if (!m) return;
-    float rx = m[0], ry = m[1], fx = m[4], fy = m[5];
-    float dx = fx, dy = fy;
-    if (dir == DIR_BKW) { dx = -fx; dy = -fy; }
-    else if (dir == DIR_LEFT) { dx = -rx; dy = -ry; }
-    else if (dir == DIR_RIGHT) { dx = rx; dy = ry; }
-    float l = sqrtf(dx * dx + dy * dy); if (l < 0.001f) return; g.dirX = dx / l; g.dirY = dy / l;
-    g.meter -= C.dodgeCost; if (g.meter < 0) g.meter = 0;
-    if (C.autoBT) g.diveSlowUntil = now + C.diveSlow;
-    g.diving = true; g.diveStart = now; g.upDone = false; g.assoc = nullptr; g.assocAlive = false;
-    void* h = g.hier[dir][var];
-    if (!h) h = g.hier[dir][VAR_1H];
-    if (h) {
-        void* clump = *(void**)U8(ped, OFF_ENT_CLUMP);
-        void* a = clump ? BlendAnim(clump, h, 0x0C /* hapus saat selesai + fade out */, C.animBlend) : nullptr;
-        if (a) {
-            *(uint16_t*)U8(a, OFF_ASSOC_FLAGS) |= 0x0C;
-            if (C.animSpeed > 0.01f && fabsf(C.animSpeed - 1.0f) > 0.001f) *F32(a, OFF_ASSOC_SPEED) *= C.animSpeed;
-            AssocSetFinishCB(a, DiveFinishCB, nullptr);
-            AssocSetDeleteCB(a, DiveFinishCB, nullptr);
-            g.assoc = a; g.assocAlive = true;
-        }
-    }
-    Log("DODGE dir=%d varian=%d anim=%s", dir, var, g.assocAlive ? "IFP" : "tanpa-animasi");
-    if (C.lockDive) *(uint16_t*)U8(GetPad(0), OFF_PAD_DISABLED) |= 1;
-}
-
-static void EndDive() {
-    g.diving = false; g.assoc = nullptr; g.assocAlive = false;
-    if (C.lockDive) { void* p = GetPad(0); if (p) *(uint16_t*)U8(p, OFF_PAD_DISABLED) &= ~1; }
-}
-
-static void HandleTap(double now) {
-    bool dbl = (now - g.lastTapT) <= C.tapWindow;
-    if (dbl && C.doubleTapDodge) { g.pendingOff = false; g.lastTapT = -100; TryDodge(now); return; }
-    g.lastTapT = now;
-    if (!g.bt) { if (g.meter >= C.actMin) StartBT(); else Log("Bullet time ditolak: meter kosong"); }
-    else if (C.doubleTapDodge) { g.pendingOff = true; g.pendingOffT = now + C.tapWindow; }
-    else StopBT();
-}
-
-static void Tick() {
-    double now = Now(); double dt = now - g.lastT; g.lastT = now; g.frames++;
-    if (dt < 0 || dt > 0.25) dt = 0;
-    if ((pUserPause && *pUserPause) || (pCodePause && *pCodePause)) dt = 0;
-    void* ped = nullptr;
-    bool ok = C.enabled && OnFoot(&ped) && !PadLocked();
-    if (!ok) {
-        if (g.bt || g.diving) { Log("Reset: pemain tidak di kondisi valid"); g.bt = false; if (g.diving) EndDive(); }
-        g.evTap = false; g.pendingOff = false; g.diveSlowUntil = 0;
-    }
-    if (ok && !g.ifpTried && g.frames > 600) LoadIFP();
-
-    if (g.evTap) { g.evTap = false; if (ok) HandleTap(now); }
-    if (g.pendingOff && now >= g.pendingOffT) { g.pendingOff = false; if (g.bt) StopBT(); }
-
-    if (g.diving) {
-        double el = now - g.diveStart;
-        bool noAnimDone = !g.assocAlive && el > 0.9;
-        if (noAnimDone || el > 7.0) EndDive();
-    }
-    if (g.bt) { g.meter -= (float)(dt / C.duration); if (g.meter <= 0) { g.meter = 0; StopBT(); } }
-    else if (!g.diving) { g.meter += (float)(C.refill * dt); if (g.meter > 1) g.meter = 1; }
-
-    bool slow = ok && (g.bt || now < g.diveSlowUntil);
-    float target = slow ? C.worldSpeed : 1.0f;
-    float span = 1.0f - C.worldSpeed;
-    float rate = span / (target < g.scale ? C.blendIn : C.blendOut);
-    if (g.scale < target) { g.scale += rate * (float)dt; if (g.scale > target) g.scale = target; }
-    else if (g.scale > target) { g.scale -= rate * (float)dt; if (g.scale < target) g.scale = target; }
-    if (g.scale < 0.9999f) { *pTimeScale = g.scale; g.scaleDirty = true; }
-    else if (g.scaleDirty) { g.scale = 1.0f; *pTimeScale = 1.0f; g.scaleDirty = false; }
-}
-
-static float CompFactor() {
-    if (g.scale >= 0.999f) return 1.0f;
-    float c = C.cjSpeed / g.scale;
-    return c < 1.0f ? 1.0f : (c > 8.0f ? 8.0f : c);
-}
-
-static void ApplyDiveVelocity(void* ped) {
-    double el = Now() - g.diveStart;
-    float k = 1.0f - (float)(el / C.diveMove);
-    float* ms = F32(ped, OFF_PHYS_MOVESPEED);
-    if (k > 0) { ms[0] = g.dirX * C.diveSpeed * k; ms[1] = g.dirY * C.diveSpeed * k; }
-    if (!g.upDone && C.diveUp > 0) { ms[2] = C.diveUp; g.upDone = true; }
-}
-
-// ------------------------------------------------------------------ hook
-DECL_HOOKv(CTimer_Update, void) { Tick(); CTimer_Update(); }
-
-DECL_HOOKv(PlayerPed_ProcessControl, void* self) {
-    float f = CompFactor();
-    if (f > 1.0001f && pTimeStep && !g.inScaled) {
-        float old = *pTimeStep; *pTimeStep = old * f; g.inScaled = true;
-        PlayerPed_ProcessControl(self);
-        *pTimeStep = old; g.inScaled = false;
-    } else PlayerPed_ProcessControl(self);
-    if (g.diving && self == FindPlayerPed(-1)) ApplyDiveVelocity(self);
-}
-
-DECL_HOOKv(Entity_UpdateAnim, void* self) {
-    if (g.scale < 0.999f && !g.inScaled && pTimeStep && self == FindPlayerPed(-1)) {
-        float f = CompFactor();
-        if (f > 1.0001f) {
-            float old = *pTimeStep; *pTimeStep = old * f; g.inScaled = true;
-            Entity_UpdateAnim(self);
-            *pTimeStep = old; g.inScaled = false;
-            return;
-        }
-    }
-    Entity_UpdateAnim(self);
-}
-
-static bool WidgetHit(void* w) {
-    int n = pMaxTouches ? *pMaxTouches : 5; if (n < 1) n = 1; if (n > 10) n = 10;
-    typedef bool (*InsideFn)(void*, V2*, int);
-    InsideFn inside = (InsideFn)((*(void***)w)[3]);
-    for (int i = 0; i < n; i++) {
-        if (!IsTouchDown(i)) continue;
-        V2 p = GetTouchPos(i);
-        if (inside(w, &p, 0)) return true;
-    }
-    if (C.useGamepad) {
-        int map = *(int*)U8(w, OFF_W_HID);
-        if (HidImplements(map) && HidIsPressed(map, nullptr)) return true;
-    }
+    float h = *(float*)(base + 0x14);
+    if(h > -20.0f && h < 20.0f) { fx = -sinf(h); fy = cosf(h); return true; }
     return false;
 }
 
-DECL_HOOKv(HydraUpdate, void* self) {
-    bool foot = C.enabled && C.hydraOnFoot && OnFoot() && !PadLocked();
-    if (foot) *U8(self, OFF_W_ENABLED) = 1; // sebelum ManageAlpha supaya tombol memudar masuk
-    HydraUpdate(self);
-    if (!foot) { g.pressPrev = false; return; }
-    if (!g.loggedFoot) { g.loggedFoot = true; Log("Hydra on-foot aktif (widget=%p)", self); }
-    *U8(self, OFF_W_SHOWN) = 1; // Update bawaan menimpa ini jadi 0 saat tanpa kendaraan
-    *U8(self, OFF_W_HILITE) = (g.bt || g.diving) ? 1 : 0;
-    bool down = WidgetHit(self);
-    if (down && !g.pressPrev) g.evTap = true;
-    g.pressPrev = down;
+static void LoadIfp()
+{
+    gIfpTried = true;
+    if(!S.useIfp) return;
+    if(!LoadAnimFile || !GetAnimationFn || !GetAnimationBlock || !BlendAnimation || !RwStreamOpenFn || !RwStreamCloseFn) { FLog("IFP: fungsi CAnimManager/RwStream tidak lengkap"); return; }
+
+    char path[500];
+    if(S.ifpPath[0]) snprintf(path, sizeof(path), "%s", S.ifpPath);
+    else
+    {
+        snprintf(path, sizeof(path), "%s/BulletTime/MP3SD.ifp", aml->GetAndroidDataPath());
+        if(!aml->FileExists(path)) snprintf(path, sizeof(path), "%s/MP3SD.ifp", aml->GetAndroidDataPath());
+    }
+    if(!aml->FileExists(path)) { FLog("IFP: file tidak ada: %s", path); return; }
+
+    // nama blok animasi ada di header IFP (ANP3): 'ANP3'(4) + ukuran(4) + nama(24)
+    char blockName[25] = {0};
+    FILE* f = fopen(path, "rb");
+    if(!f) { FLog("IFP: gagal membuka %s", path); return; }
+    unsigned char hdr[32];
+    size_t got = fread(hdr, 1, 32, f);
+    fclose(f);
+    if(got != 32 || memcmp(hdr, "ANP3", 4) != 0) { FLog("IFP: header bukan ANP3 (format tidak didukung)"); return; }
+    memcpy(blockName, hdr + 8, 24);
+    memcpy(gBlockName, blockName, sizeof(blockName));
+
+    // loader bawaan mendaftarkan blok dari header sendiri (RegisterAnimBlock tidak perlu dipanggil)
+    void* blk = GetAnimationBlock(blockName);
+    if(!blk)
+    {
+        // baca file ke memori dan buka sebagai stream memori RenderWare
+        // (LoadAnimFile(path) langsung crash di port Android karena stream file gagal dibuka)
+        FILE* g = fopen(path, "rb");
+        if(!g) { FLog("IFP: gagal membuka %s", path); return; }
+        fseek(g, 0, SEEK_END); long size = ftell(g); fseek(g, 0, SEEK_SET);
+        if(size < 64 || size > 64 * 1024 * 1024) { fclose(g); FLog("IFP: ukuran file aneh (%ld)", size); return; }
+        uint8_t* buf = (uint8_t*)malloc((size_t)size);
+        if(!buf || fread(buf, 1, (size_t)size, g) != (size_t)size) { fclose(g); free(buf); FLog("IFP: gagal membaca file"); return; }
+        fclose(g);
+
+        RwMemory mem = { buf, (uint32_t)size };
+        FLog("IFP: membuka stream memori (%ld byte)", size);
+        void* st = RwStreamOpenFn(3 /*rwSTREAMMEMORY*/, 1 /*rwSTREAMREAD*/, &mem);
+        if(!st) { FLog("IFP: RwStreamOpen gagal"); free(buf); return; }
+        FLog("IFP: memanggil CAnimManager::LoadAnimFile");
+        LoadAnimFile(st, true, NULL);
+        FLog("IFP: LoadAnimFile selesai");
+        RwStreamCloseFn(st, &mem);
+        free(buf);
+    }
+    blk = GetAnimationBlock(blockName);
+    if(!blk) { FLog("IFP: blok '%s' tidak terdaftar setelah LoadAnimFile (%s)", blockName, path); return; }
+
+    int found = 0;
+    for(int i = 0; i < 4; ++i) { gDiveHier[i] = GetAnimationFn(kDiveNames[i], blk); if(gDiveHier[i]) ++found; }
+    FLog("IFP: blok '%s' dimuat dari %s, %d/4 animasi dive ditemukan", blockName, path, found);
 }
 
-DECL_HOOKv(HydraDraw, void* self) {
-    if (C.enabled && C.hydraOnFoot && FindPlayerPed(-1) && !FindPlayerVehicle(-1, false)) *U8(self, OFF_W_SHOWN) = 1;
-    HydraDraw(self);
+// Task yang sekarang ada di slot dive (CTaskManager di CPedIntelligence+8: primer mulai +0, sekunder mulai +40)
+static void* DiveSlotTask(void* ped)
+{
+    if(!ped) return NULL;
+    void* intel = *(void**)((uintptr_t)ped + 1336);
+    if(!intel) return NULL;
+    uint8_t* mgr = (uint8_t*)intel + 8;
+    return gDiveSecondary ? *(void**)(mgr + 40 + 4 * 8) : *(void**)(mgr + 3 * 8);
 }
 
-DECL_HOOKv(KillCalc, void* self, void* victim, void* resp, bool b) {
-    float hp = victim ? *F32(victim, OFF_PED_HEALTH) : 0.0f;
-    void* damager = *(void**)self;
-    KillCalc(self, victim, resp, b);
-    if (hp > 0.0f && damager && damager == FindPlayerPed(-1) && victim != damager &&
-        (*U8(resp, 8) || *U8(resp, 9))) {
-        double now = Now();
-        if (victim == g.lastVictim && now - g.lastKillT < 1.0) return;
-        g.lastVictim = victim; g.lastKillT = now;
-        g.meter += C.killRefill; if (g.meter > 1) g.meter = 1;
-        Log("Kill! meter=%.2f", g.meter);
+// Akhiri task dive dengan benar: MakeAbortable(immediate) melepas animasi (tidak tertinggal beku), lalu slot dikosongkan
+static void EndDiveTask(void* ped)
+{
+    if(!gDiveTaskLive) return;
+    gDiveTaskLive = false;
+    gDiveAnimT = 0.0f;
+    void* task = gDiveTask;
+    gDiveTask = NULL;
+    if(!ped || !task) return;
+    if(DiveSlotTask(ped) != task) return;        // sudah selesai/dihapus game sendiri
+    if(MakeAbortableFn) MakeAbortableFn(task, ped, 2 /*immediate*/, NULL);
+    void* intel = *(void**)((uintptr_t)ped + 1336);
+    if(!intel) return;
+    void* mgr = (uint8_t*)intel + 8;
+    if(gDiveSecondary && SetTaskSecFn) SetTaskSecFn(mgr, NULL, 4);
+    else if(SetTaskFn) SetTaskFn(mgr, NULL, 3, false);
+}
+
+static bool DoDodge(void* ped, int16_t* pad)
+{
+    if(!ApplyMoveForce || !ped) { FLog("Dodge: ApplyMoveForce=%p ped=%p", (void*)ApplyMoveForce, ped); return false; }
+    float fx, fy;
+    if(!GetPedForward(ped, fx, fy))
+    {
+        uintptr_t b = (uintptr_t)ped; void* mat = *(void**)(b + 0x18);
+        FLog("Dodge: arah hadap ped tidak valid (matrix=%p heading=%.2f)", mat, *(float*)(b + 0x14));
+        return false;
+    }
+
+    int dir = 0;                                 // 0 maju, 1 mundur, 2 kiri, 3 kanan
+    int sx = pad[0], sy = pad[1];
+    if(abs(sx) > 30 || abs(sy) > 30)
+    {
+        if(abs(sy) >= abs(sx)) dir = (sy > 0) ? 1 : 0;
+        else dir = (sx > 0) ? 3 : 2;
+    }
+    float dx = fx, dy = fy;
+    if(dir == 1) { dx = -fx; dy = -fy; }
+    else if(dir == 2) { dx = -fy; dy = fx; }
+    else if(dir == 3) { dx = fy; dy = -fx; }
+
+    float mass = *(float*)((uintptr_t)ped + 176);
+    if(!(mass > 1.0f && mass < 2000.0f)) mass = 70.0f;
+
+    // dorongan vertikal opsional (bawaan 0 supaya CJ tidak masuk status "melayang" yang menimpa animasi)
+    if(S.diveUp > 0.0f)
+    {
+        CVector up = { 0.0f, 0.0f, S.diveUp * mass };
+        ApplyMoveForce(ped, up);
+    }
+    // meluncur mendatar selama DashSeconds (diterapkan tiap frame di hook pemain)
+    gDashT = S.dashSeconds; gDashDX = dx; gDashDY = dy;
+
+    // animasi lewat task bawaan game (CTaskSimpleRunNamedAnim), seperti script TASK_PLAY_ANIM.
+    // Slot sekunder PARTIAL_ANIM (4): task jalan CJ tetap aktif, jadi aim & tembak tetap bisa saat dive.
+    bool tasked = false;
+    void* clump = *(void**)((uintptr_t)ped + 0x20);
+    if(S.useTask && gDiveHier[dir] && gBlockName[0] && TaskNewFn && RunNamedCtor && (SetTaskFn || SetTaskSecFn))
+    {
+        void* intel = *(void**)((uintptr_t)ped + 1336);     // CPed::m_pIntelligence; CTaskManager di +8
+        EndDiveTask(ped);                                    // buang task dive sebelumnya kalau masih ada
+        void* t = intel ? TaskNewFn(120) : NULL;
+        if(t)
+        {
+            // endTime=-1: diakhiri oleh mod sesudah DiveDuration; bHoldLastFrame=true menahan pose dive
+            RunNamedCtor(t, kDiveNames[dir], gBlockName, S.taskFlags, S.animBlend, -1, false, false, false, S.holdLastFrame);
+            void* mgr = (uint8_t*)intel + 8;
+            if(S.useSecondary && SetTaskSecFn) { SetTaskSecFn(mgr, t, 4); gDiveSecondary = true; }
+            else if(SetTaskFn) { SetTaskFn(mgr, t, 3, false); gDiveSecondary = false; }
+            gDiveTask = t;
+            gAimKickT = 0.4f;
+            gDiveTaskLive = true;
+            gDiveAnimT = S.diveDuration;
+            tasked = true;
+        }
+    }
+
+    bool animPlayed = tasked;
+    void* assoc = NULL;
+    if(!tasked && gDiveHier[dir] && BlendAnimation && clump)
+    {
+        assoc = BlendAnimation(clump, gDiveHier[dir], S.animFlags, S.animBlend);
+        animPlayed = assoc != NULL;
+    }
+    if(!animPlayed && S.fallbackJump) pad[kBtnSquare] = 255;   // tanpa IFP: lompat bawaan
+    { static int n = 0; if(++n <= 8) FLog("Dodge #%d arah=%d task=%d slot=%s assoc=%p fwd=(%.2f,%.2f) aimSebelum=%d", n, dir, (int)tasked, gDiveSecondary ? "sekunder" : "utama", assoc, fx, fy, gLastTargetReal); }
+
+    if(S.autoBulletTime && gMeter > S.activationMin) gDiveSlow = S.diveSlow;
+    return true;
+}
+
+// ---------------------------------------------------------------- per-frame logic (dipanggil dari CPlayerPed::ProcessControl)
+static void Tick(void* ped)
+{
+    float dt = RealDelta();
+    int16_t* pad = GetPad ? (int16_t*)GetPad(0) : NULL;
+    bool inVehicle = FindPlayerVehicle && FindPlayerVehicle(0, false);
+    bool canAct = pad && !inVehicle;             // tombol tidak bisa dipicu saat berkendara
+    if(!canAct) { gManual = false; gDiveSlow = 0.0f; EndDiveTask(ped); }
+
+    if(!gIfpTried) LoadIfp();
+
+    if(pad && S.debugPad)
+    {
+        for(int i = 4; i < kPadCount; ++i)
+        {
+            if(pad[i] != gPrevPad[i]) logger->Info("Pad %s = %d", kPadNames[i], (int)pad[i]);
+            gPrevPad[i] = pad[i];
+        }
+    }
+
+    // tombol hidrolik di mode jalan: mode 0 = tap bullet time on/off, tap 2x cepat = dodge; mode 1 = tap = dodge
+    if(gHydraTap)
+    {
+        gHydraTap = false;
+        double now = RealNow();
+        double gap = now - gHydraLast;
+        bool dodge = (S.hydraMode == 1) || (S.hydraDodge && gap <= S.tapWindow);
+        static int tn = 0;
+        if(++tn <= 24) FLog("Tap #%d selang=%.2fs aksi=%s bisa=%d meter=%.2f", tn, gap > 100.0 ? -1.0 : gap, dodge ? "dodge" : "bullet-time", (int)canAct, gMeter);
+        if(canAct)
+        {
+            if(dodge) { bool ok = DoDodge(ped, pad); if(!ok) FLog("Dodge gagal dijalankan (lihat baris di atas)"); gHydraLast = -10.0; }
+            else
+            {
+                if(gManual) gManual = false;
+                else if(gMeter > S.activationMin) gManual = true;
+                gHydraLast = now;
+            }
+        }
+    }
+
+    // tombol pad opsional
+    if(canAct && S.activateBtn >= 0)
+    {
+        bool down = pad[S.activateBtn] > 0;
+        if(S.holdToActivate) gManual = down && gMeter > S.activationMin;
+        else if(down && !gPrevActivate)
+        {
+            if(gManual) gManual = false;
+            else if(gMeter > S.activationMin) gManual = true;
+        }
+        gPrevActivate = down;
+    }
+    if(canAct && S.diveBtn >= 0)
+    {
+        bool down = pad[S.diveBtn] > 0;
+        if(down && !gPrevDive)
+        {
+            float now = (float)RealNow();
+            if(now - gLastTap <= S.tapWindow) { DoDodge(ped, pad); gLastTap = -10.0f; }
+            else gLastTap = now;
+        }
+        gPrevDive = down;
+    }
+
+    if(gDashT > 0.0f) gDashT -= dt;
+    if(gAimKickT > 0.0f) gAimKickT -= dt;
+    if(gDiveTaskLive)
+    {
+        gDiveAnimT -= dt;
+        if(DiveSlotTask(ped) != gDiveTask)
+        {
+            // animasi selesai dan game sudah membuang task-nya: kontrol langsung normal lagi
+            gDiveTaskLive = false; gDiveTask = NULL; gDiveAnimT = 0.0f;
+            static int en = 0; if(++en <= 8) FLog("Dive selesai (task habis sendiri)");
+        }
+        else
+        {
+            if(pad && S.freezeStick) { pad[0] = 0; pad[1] = 0; }   // CJ tidak berjalan sendiri selama animasi dive
+            if(gDiveAnimT <= 0.0f) { static int tn2 = 0; if(++tn2 <= 8) FLog("Dive dihentikan paksa (batas waktu)"); EndDiveTask(ped); }
+        }
+    }
+
+    // meter adrenalin
+    if(BulletTimeOn())
+    {
+        gMeter -= dt / S.duration;
+        if(gDiveSlow > 0.0f) gDiveSlow -= dt;
+        if(gMeter <= 0.0f) { gMeter = 0.0f; gManual = false; gDiveSlow = 0.0f; }
+    }
+    else
+    {
+        gMeter += S.refill * dt;
+        if(gMeter > 1.0f) gMeter = 1.0f;
+    }
+
+    // time scale dunia: hanya disentuh selama bullet time/transisi (supaya tidak mengganggu misi & cutscene)
+    if(pTimeScale && (BulletTimeOn() || gScale < 0.999f))
+    {
+        float target = BulletTimeOn() ? S.worldSpeed : 1.0f;
+        float range = 1.0f - S.worldSpeed;
+        float rate = range / (target < gScale ? S.blendIn : S.blendOut);
+        if(gScale > target) { gScale -= rate * dt; if(gScale < target) gScale = target; }
+        else if(gScale < target) { gScale += rate * dt; if(gScale > target) gScale = target; }
+        *pTimeScale = gScale;
+    }
+    gFactor = (gScale < 0.999f && S.cjSpeed > gScale) ? (S.cjSpeed / gScale) : 1.0f;
+}
+
+// ---------------------------------------------------------------- hooks
+// luncuran mendatar dodge: atur kecepatan gerak ped (CPhysical::m_vecMoveSpeed di +104) selama DashSeconds
+static void ApplyDash(void* ped)
+{
+    if(gDashT <= 0.0f || !ped) return;
+    float f = gDashT / (S.dashSeconds > 0.01f ? S.dashSeconds : 0.01f);
+    if(f > 1.0f) f = 1.0f;
+    float* ms = (float*)((uintptr_t)ped + 104);
+    ms[0] = gDashDX * S.diveForward * f;
+    ms[1] = gDashDY * S.diveForward * f;
+}
+
+static void PlayerProcess_hook(void* self)
+{
+    if(S.enabled) { Tick(self); ApplyDash(self); }
+
+    if(S.enabled && pTimeStep && gFactor > 1.001f)
+    {
+        float saved = *pTimeStep;
+        *pTimeStep = saved * gFactor;            // CJ lebih cepat dari dunia
+        gInPlayerProcess = true;
+        PlayerProcess_orig(self);
+        gInPlayerProcess = false;
+        *pTimeStep = saved;
+    }
+    else PlayerProcess_orig(self);
+    if(S.enabled) ApplyDash(self);
+}
+
+// --- status aim (membidik) ---
+static void LogAim(const char* what, int v)
+{
+    if(!S.logAim || gAimLogN >= 80) return;
+    static int last[3] = { -1, -1, -1 };
+    int k = what[3] == 'T' ? 0 : (what[3] == 'E' ? 1 : 2);   // GetTarget / GetEnter... / GetExit...
+    if(last[k] == v) return;
+    last[k] = v; ++gAimLogN;
+    FLog("Aim: %s=%d (dive=%d)", what, v, (int)gDiveTaskLive);
+}
+
+static bool Target_hook(void* pad, bool b)
+{
+    bool r = Target_orig(pad, b);
+    gLastTargetReal = r ? 1 : 0;
+    LogAim("GetTarget", r);
+    if(S.enabled && S.forceAim && gDiveTaskLive) r = true;
+    return r;
+}
+static bool EnterT_hook(void* pad)
+{
+    bool r = EnterT_orig(pad);
+    LogAim("GetEnterTargeting", r);
+    if(S.enabled && S.forceAim && gAimKickT > 0.0f) r = true;
+    return r;
+}
+static bool ExitT_hook(void* pad)
+{
+    bool r = ExitT_orig(pad);
+    LogAim("GetExitTargeting", r);
+    if(S.enabled && S.forceAim && gDiveTaskLive) r = false;
+    return r;
+}
+
+static void AnimUpdate_hook(void* clump, float dt, bool onScreen)
+{
+    if(S.enabled && (gFactor > 1.001f || gDiveTaskLive) && clump && FindPlayerPed)
+    {
+        void* ped = FindPlayerPed(0);
+        if(ped && clump == *(void**)((uintptr_t)ped + 0x20))
+        {
+            if(gFactor > 1.001f && !gInPlayerProcess) dt *= gFactor;
+            if(gDiveTaskLive) dt *= S.diveAnimSpeed;          // dive lebih lambat = lebih lama
+        }
+    }
+    AnimUpdate_orig(clump, dt, onScreen);
+}
+
+// Tombol hidrolik (CWidgetButtonHydraulics): +200 = aktif, +201 = tampil, +140 = flag widget (bit2 = nonaktif).
+// Update() bawaan mengosongkan +200/+201 saat tidak di kendaraan; di sini diaktifkan lagi saat berjalan kaki.
+static int   gHUpdFoot = 0, gHDrawFoot = 0;
+static bool  gHVehLogged = false, gHSumLogged = false;
+static double gHFirstFoot = 0.0;
+static bool  gOnFootNow = false;
+
+static void HydraUpdate_hook(void* self)
+{
+    HydraUpdate_orig(self);
+    if(!S.enabled || !S.hydraButton || !FindPlayerPed) return;
+    uint8_t* w = (uint8_t*)self;
+    uint32_t* fl = (uint32_t*)(w + 140);
+
+    void* ped = FindPlayerPed(0);
+    if(!ped)
+    {
+        gOnFootNow = false;
+        if(gScale < 0.999f && pTimeScale) { gScale = 1.0f; *pTimeScale = 1.0f; }
+        gManual = false; gDiveSlow = 0.0f; gHydraPrev = false;
+        return;
+    }
+    if(FindPlayerVehicle && FindPlayerVehicle(0, false))
+    {
+        gOnFootNow = false; gHydraPrev = false;
+        if(!gHVehLogged) { gHVehLogged = true; FLog("Hydra di kendaraan: aktif=%d tampil=%d flag140=0x%x", (int)w[200], (int)w[201], *fl); }
+        return;
+    }
+
+    gOnFootNow = true;
+    ++gHUpdFoot;
+    if(!gHydraLogged)
+    {
+        gHydraLogged = true;
+        gHFirstFoot = RealNow();
+        FLog("Hydra Update dipanggil saat jalan kaki. Sebelum: aktif=%d tampil=%d enabled=%d alpha=%d flag140=0x%x", (int)w[200], (int)w[201], (int)w[89], (int)w[88], *fl);
+    }
+    *fl = (*fl & ~S.hydraFlagClear) | S.hydraFlagSet;
+    w[200] = 1;      // aktif
+    w[201] = 1;      // tampil
+    w[89]  = 1;      // CWidget "enabled" (SetEnabled)
+    w[88]  = 255;    // alpha saat ini; 0 = digambar transparan (penyebab tombol tak terlihat)
+    if(gHFirstFoot > 0.0 && !gHSumLogged && RealNow() - gHFirstFoot > 8.0)
+    {
+        gHSumLogged = true;
+        FLog("Ringkasan 8 detik jalan kaki: Update=%d Draw=%d flag140=0x%x (clear=0x%x set=0x%x)", gHUpdFoot, gHDrawFoot, *fl, S.hydraFlagClear, S.hydraFlagSet);
+    }
+
+    void** vt = *(void***)self;
+    bool touched = ((WidgetIsTouched_t)vt[20])(self, NULL);
+    if(touched && !gHydraPrev)
+    {
+        gHydraTap = true;
+        static int taps = 0;
+        if(++taps <= 8) FLog("Tombol hidrolik ditekan (#%d)", taps);
+    }
+    gHydraPrev = touched;
+}
+
+// Bar adrenalin bullet time (digambar tiap frame saat jalan kaki, dari hook Draw tombol hidrolik)
+static void DrawBar()
+{
+    if(!S.showBar || !DrawRectFn || !pRsGlobal) return;
+    int W = *(int*)(pRsGlobal + 8), H = *(int*)(pRsGlobal + 12);
+    static bool logged = false;
+    if(!logged) { logged = true; FLog("Bar: layar %dx%d", W, H); }
+    if(W < 200 || W > 10000 || H < 200 || H > 10000) return;
+
+    float x = S.barX * W, y = S.barY * H, w = S.barW * W, h = S.barH * H;
+    float pad = h * 0.18f; if(pad < 1.5f) pad = 1.5f;
+
+    CRGBA border = { 0, 0, 0, 200 };
+    CRect rb = { x - 1.0f, y + h + 1.0f, x + w + 1.0f, y - 1.0f };
+    DrawRectFn(rb, border);
+    CRGBA back = { 25, 25, 30, 170 };
+    CRect rk = { x, y + h, x + w, y };
+    DrawRectFn(rk, back);
+
+    float m = gMeter < 0.0f ? 0.0f : (gMeter > 1.0f ? 1.0f : gMeter);
+    float fw = (w - 2.0f * pad) * m;
+    if(fw > 0.5f)
+    {
+        CRGBA col;
+        if(BulletTimeOn()) col = { 90, 210, 255, 235 };        // aktif
+        else if(m < 0.25f) col = { 255, 130, 60, 220 };        // hampir habis / mengisi
+        else col = { 235, 235, 235, 210 };
+        CRect rf = { x + pad, y + h - pad, x + pad + fw, y + pad };
+        DrawRectFn(rf, col);
     }
 }
 
-// Aim & tembak saat dodge: paksa mode bidik masuk (kalau belum) dan jangan keluar selama melayang.
-// Menembak tetap dari tombol tembak pemain (atau otomatis kalau AutoFireDuringDive=1).
-DECL_HOOK(bool, PadEnterTargeting, void* pad) {
-    bool r = PadEnterTargeting(pad);
-    if (r || !g.diving || !C.aimDive) return r;
-    void* ped = FindPlayerPed(-1);
-    if (ped && HasGun(ped) && Now() - g.diveStart < 0.5 && !IsAiming(ped)) return true;
-    return r;
-}
-DECL_HOOK(bool, PadExitTargeting, void* pad) {
-    bool r = PadExitTargeting(pad);
-    if (r && g.diving && C.aimDive) { void* ped = FindPlayerPed(-1); if (ped && HasGun(ped)) return false; }
-    return r;
-}
-DECL_HOOK(bool, PadGetWeapon, void* pad, void* ped, bool b) {
-    bool r = PadGetWeapon(pad, ped, b);
-    if (!r && g.diving && C.autoFire && ped && ped == FindPlayerPed(-1) && HasGun(ped) && IsAiming(ped)) return true;
-    return r;
+static void HydraDraw_hook(void* self)
+{
+    if(gOnFootNow) ++gHDrawFoot;
+    HydraDraw_orig(self);
+    if(gOnFootNow) DrawBar();
 }
 
-static void DrawBar() {
-    if (!C.enabled || g.frames < 60) return;
-    if (!OnFoot()) return;
-    if (g.meter >= 0.999f && !g.bt && !g.diving) return;
-    float W = (float)ScreenW(), H = (float)ScreenH();
-    float x = C.barX * W, y = C.barY * H, w = C.barW * W, h = C.barH * H;
-    Rgba bg = { 0, 0, 0, 150 }, fill = g.bt ? Rgba{ 80, 170, 255, 230 } : Rgba{ 255, 190, 40, 230 };
-    if (!g.bt && g.meter < C.actMin) fill = Rgba{ 200, 60, 60, 230 };
-    float pad = h * 0.18f;
-    RectF o = { x, y, x + w, y + h };
-    DrawRectXLU(o, bg, bg, bg, bg);
-    float fw = (w - 2 * pad) * (g.meter < 0 ? 0 : (g.meter > 1 ? 1 : g.meter));
-    if (fw > 0.5f) { RectF i = { x + pad, y + pad, x + pad + fw, y + h - pad }; DrawRectXLU(i, fill, fill, fill, fill); }
+// ---------------------------------------------------------------- init
+static uintptr_t Sym(void* lib, const char* name)
+{
+    uintptr_t a = aml->GetSym(lib, name);
+    if(!a) logger->Error("Simbol tidak ditemukan: %s", name);
+    return a;
 }
 
-DECL_HOOKv(CHud_Draw, void) { CHud_Draw(); DrawBar(); }
-
-// ------------------------------------------------------------------ pasang
-static bool Sig(uintptr_t a, uint32_t w0) { return a && *(uint32_t*)a == w0; }
-
-template <class T> static bool Bind(void* h, T& fn, const char* sym) {
-    uintptr_t a = aml->GetSym(h, sym); fn = (T)a;
-    if (!a) Log("Simbol tidak ketemu: %s", sym);
-    return a != 0;
-}
-
-ON_MOD_LOAD() {
+ON_MOD_LOAD()
+{
     logger->SetTag("BulletTimeSA64");
-    flog.Write("=== BulletTimeSA64 v2.0 dimulai ===");
-    void* h = aml->GetLibHandle("libGTASA.so");
-    if (!h) { flog.Error("libGTASA.so tidak ditemukan"); return; }
-    LoadCfg();
-    g.meter = C.startMeter;
+    LoadSettings();
+    gMeter = S.startMeter < 0.0f ? 0.0f : (S.startMeter > 1.0f ? 1.0f : S.startMeter);
+    if(!S.enabled) { logger->Info("Dimatikan lewat ini"); return; }
 
-    bool ok = true;
-    ok &= Bind(h, FindPlayerPed, "_Z13FindPlayerPedi");
-    ok &= Bind(h, FindPlayerVehicle, "_Z17FindPlayerVehicleib");
-    ok &= Bind(h, GetPad, "_ZN4CPad6GetPadEi");
-    ok &= Bind(h, PadWalkLR, "_ZN4CPad19GetPedWalkLeftRightEv");
-    ok &= Bind(h, PadWalkUD, "_ZN4CPad16GetPedWalkUpDownEv");
-    ok &= Bind(h, PedInControl, "_ZN4CPed14IsPedInControlEv");
-    ok &= Bind(h, PedWeaponSkill, "_ZN4CPed14GetWeaponSkillE11eWeaponType");
-    ok &= Bind(h, LoadAnimFileStream, "_ZN12CAnimManager12LoadAnimFileEP8RwStreambPA32_Kc");
-    ok &= Bind(h, RwStreamOpenF, "_Z12RwStreamOpen12RwStreamType18RwStreamAccessTypePKv");
-    ok &= Bind(h, RwStreamCloseF, "_Z13RwStreamCloseP8RwStreamPv");
-    ok &= Bind(h, GetAnimBlock, "_ZN12CAnimManager17GetAnimationBlockEPKc");
-    ok &= Bind(h, GetAnimBlockIndex, "_ZN12CAnimManager22GetAnimationBlockIndexEPKc");
-    ok &= Bind(h, AddAnimBlockRef, "_ZN12CAnimManager15AddAnimBlockRefEi");
-    ok &= Bind(h, GetAnim, "_ZN12CAnimManager12GetAnimationEPKcPK10CAnimBlock");
-    ok &= Bind(h, FindActiveTask, "_ZNK12CTaskManager20FindActiveTaskByTypeEi");
-    ok &= Bind(h, BlendAnim, "_ZN12CAnimManager14BlendAnimationEP7RpClumpP19CAnimBlendHierarchyif");
-    ok &= Bind(h, AssocSetFinishCB, "_ZN21CAnimBlendAssociation17SetFinishCallbackEPFvPS_PvES1_");
-    ok &= Bind(h, AssocSetDeleteCB, "_ZN21CAnimBlendAssociation17SetDeleteCallbackEPFvPS_PvES1_");
-    ok &= Bind(h, IsTouchDown, "_ZN15CTouchInterface11IsTouchDownEi");
-    ok &= Bind(h, GetTouchPos, "_ZN15CTouchInterface16GetTouchPositionEi");
-    ok &= Bind(h, HidImplements, "_ZN4CHID10ImplementsE10HIDMapping");
-    ok &= Bind(h, HidIsPressed, "_ZN4CHID9IsPressedE10HIDMappingPf");
-    ok &= Bind(h, DrawRectXLU, "_ZN9CSprite2d11DrawRectXLUERK5CRectRK5CRGBAS5_S5_S5_");
-    ok &= Bind(h, ScreenW, "_Z17OS_ScreenGetWidthv");
-    ok &= Bind(h, ScreenH, "_Z18OS_ScreenGetHeightv");
-    pTimeScale = (float*)aml->GetSym(h, "_ZN6CTimer13ms_fTimeScaleE");
-    pTimeStep = (float*)aml->GetSym(h, "_ZN6CTimer12ms_fTimeStepE");
-    pUserPause = (uint8_t*)aml->GetSym(h, "_ZN6CTimer11m_UserPauseE");
-    pCodePause = (uint8_t*)aml->GetSym(h, "_ZN6CTimer11m_CodePauseE");
-    pMaxTouches = (int*)aml->GetSym(h, "_ZN15CTouchInterface13m_nMaxTouchesE");
-    ok &= (pTimeScale && pTimeStep);
-    if (!ok) { flog.Error("Ada simbol yang hilang -> mod dimatikan (versi libGTASA.so tidak cocok?)"); return; }
+    void* lib = aml->GetLibHandle("libGTASA.so");
+    if(!lib) { logger->Error("libGTASA.so tidak ditemukan"); return; }
 
-    // pemeriksaan versi: offset struct dipakai, jadi prolog fungsi harus cocok dengan libGTASA.so referensi
-    uintptr_t aSkill = aml->GetSym(h, "_ZN4CPed14GetWeaponSkillEv");
-    uintptr_t aMove = aml->GetSym(h, "_ZN9CPhysical13ApplyMoveSpeedEv");
-    uintptr_t aRw = aml->GetSym(h, "_ZN7CEntity13UpdateRwFrameEv");
-    bool ver = Sig(aSkill, 0x39a37008) && Sig(aMove, 0x7940c808) && Sig(aRw, 0xf9401008);
-    uintptr_t aHU = aml->GetSym(h, "_ZN23CWidgetButtonHydraulics6UpdateEv");
-    uintptr_t aHD = aml->GetSym(h, "_ZN23CWidgetButtonHydraulics4DrawEv");
-    uintptr_t aPC = aml->GetSym(h, "_ZN10CPlayerPed14ProcessControlEv");
-    uintptr_t aUA = aml->GetSym(h, "_ZN7CEntity10UpdateAnimEv");
-    uintptr_t aKC = aml->GetSym(h, "_ZN28CPedDamageResponseCalculator18ComputeWillKillPedEP4CPedR18CPedDamageResponseb");
-    uintptr_t aHud = aml->GetSym(h, "_ZN4CHud4DrawEv");
-    uintptr_t aTU = aml->GetSym(h, "_ZN6CTimer6UpdateEv");
-    uintptr_t aEnter = aml->GetSym(h, "_ZN4CPad17GetEnterTargetingEv");
-    uintptr_t aExit = aml->GetSym(h, "_ZN4CPad16GetExitTargetingEv");
-    uintptr_t aWpn = aml->GetSym(h, "_ZN4CPad9GetWeaponEP4CPedb");
-    flog.Write("Cek versi offset: %s", ver ? "COCOK" : "TIDAK COCOK (hook dimatikan)");
-    if (!ver) return;
-
-    if (Sig(aTU, 0xf81d0ff5)) aml->Hook((void*)aTU, (void*)HookOf_CTimer_Update, (void**)&CTimer_Update); else flog.Error("CTimer::Update tidak cocok");
-    if (Sig(aHud, 0xa9be4ff4)) aml->Hook((void*)aHud, (void*)HookOf_CHud_Draw, (void**)&CHud_Draw); else flog.Error("CHud::Draw tidak cocok");
-    if (C.hookHydra) {
-        if (Sig(aHU, 0xfc1d0fe8)) aml->Hook((void*)aHU, (void*)HookOf_HydraUpdate, (void**)&HydraUpdate); else flog.Error("Hydra::Update tidak cocok");
-        if (Sig(aHD, 0xd100c3ff)) aml->Hook((void*)aHD, (void*)HookOf_HydraDraw, (void**)&HydraDraw); else flog.Error("Hydra::Draw tidak cocok");
+    pTimeScale        = (float*)Sym(lib, "_ZN6CTimer13ms_fTimeScaleE");
+    pTimeStep         = (float*)Sym(lib, "_ZN6CTimer12ms_fTimeStepE");
+    GetPad            = (GetPad_t)Sym(lib, "_ZN4CPad6GetPadEi");
+    FindPlayerPed     = (FindPlayerPed_t)Sym(lib, "_Z13FindPlayerPedi");
+    FindPlayerVehicle = (FindPlayerVehicle_t)Sym(lib, "_Z17FindPlayerVehicleib");
+    ApplyMoveForce    = (ApplyMoveForce_t)Sym(lib, "_ZN9CPhysical14ApplyMoveForceE7CVector");
+    if(S.useIfp)
+    {
+        GetAnimationBlock = (GetAnimationBlock_t)Sym(lib, "_ZN12CAnimManager17GetAnimationBlockEPKc");
+        LoadAnimFile      = (LoadAnimFile_t)Sym(lib, "_ZN12CAnimManager12LoadAnimFileEP8RwStreambPA32_Kc");
+        RwStreamOpenFn    = (RwStreamOpen_t)Sym(lib, "_Z12RwStreamOpen12RwStreamType18RwStreamAccessTypePKv");
+        RwStreamCloseFn   = (RwStreamClose_t)Sym(lib, "_Z13RwStreamCloseP8RwStreamPv");
+        GetAnimationFn    = (GetAnimation_t)Sym(lib, "_ZN12CAnimManager12GetAnimationEPKcPK10CAnimBlock");
+        BlendAnimation    = (BlendAnimation_t)Sym(lib, "_ZN12CAnimManager14BlendAnimationEP7RpClumpP19CAnimBlendHierarchyif");
     }
-    if (C.hookPlayer) { if (Sig(aPC, 0xd10243ff)) aml->Hook((void*)aPC, (void*)HookOf_PlayerPed_ProcessControl, (void**)&PlayerPed_ProcessControl); else flog.Error("PlayerPed::ProcessControl tidak cocok"); }
-    if (C.hookAnim) { if (Sig(aUA, 0xd10103ff)) aml->Hook((void*)aUA, (void*)HookOf_Entity_UpdateAnim, (void**)&Entity_UpdateAnim); else flog.Error("Entity::UpdateAnim tidak cocok"); }
-    if (C.hookAim && C.aimDive) {
-        if (Sig(aEnter, 0xa9be4ff4)) aml->Hook((void*)aEnter, (void*)HookOf_PadEnterTargeting, (void**)&PadEnterTargeting); else flog.Error("CPad::GetEnterTargeting tidak cocok");
-        if (Sig(aExit, 0xa9be4ff4)) aml->Hook((void*)aExit, (void*)HookOf_PadExitTargeting, (void**)&PadExitTargeting); else flog.Error("CPad::GetExitTargeting tidak cocok");
-        if (C.autoFire) { if (Sig(aWpn, 0xa9be4ff4)) aml->Hook((void*)aWpn, (void*)HookOf_PadGetWeapon, (void**)&PadGetWeapon); else flog.Error("CPad::GetWeapon tidak cocok"); }
+
+    TaskNewFn    = (TaskNew_t)Sym(lib, "_ZN5CTasknwEm");
+    RunNamedCtor = (RunNamedAnimCtor_t)Sym(lib, "_ZN23CTaskSimpleRunNamedAnimC1EPKcS1_ifibbbb");
+    SetTaskFn    = (SetTask_t)Sym(lib, "_ZN12CTaskManager7SetTaskEP5CTaskib");
+    SetTaskSecFn = (SetTaskSecondary_t)Sym(lib, "_ZN12CTaskManager16SetTaskSecondaryEP5CTaski");
+    MakeAbortableFn = (MakeAbortable_t)Sym(lib, "_ZN15CTaskSimpleAnim13MakeAbortableEP4CPediPK6CEvent");
+    DrawRectFn = (DrawRect_t)Sym(lib, "_ZN9CSprite2d8DrawRectERK5CRectRK5CRGBA");
+    pRsGlobal  = (uint8_t*)Sym(lib, "RsGlobal");
+    uintptr_t aimTarget = Sym(lib, "_ZN4CPad9GetTargetEb");
+    uintptr_t aimEnter  = Sym(lib, "_ZN4CPad17GetEnterTargetingEv");
+    uintptr_t aimExit   = Sym(lib, "_ZN4CPad16GetExitTargetingEv");
+    uintptr_t playerProcess = Sym(lib, "_ZN10CPlayerPed14ProcessControlEv");
+    uintptr_t animUpdate    = Sym(lib, "_Z32RpAnimBlendClumpUpdateAnimationsP7RpClumpfb");
+    uintptr_t hydraUpdate   = Sym(lib, "_ZN23CWidgetButtonHydraulics6UpdateEv");
+    uintptr_t hydraDraw     = Sym(lib, "_ZN23CWidgetButtonHydraulics4DrawEv");
+
+    if(S.hookPlayer && playerProcess && pTimeScale && GetPad)
+        aml->Hook((void*)playerProcess, (void*)PlayerProcess_hook, (void**)&PlayerProcess_orig);
+    else logger->Error("Hook pemain TIDAK dipasang (bullet time/dodge mati)");
+
+    if(S.hookAnim && animUpdate)
+        aml->Hook((void*)animUpdate, (void*)AnimUpdate_hook, (void**)&AnimUpdate_orig);
+
+    if(S.hookHydra && S.hydraButton && hydraUpdate)
+    {
+        aml->Hook((void*)hydraUpdate, (void*)HydraUpdate_hook, (void**)&HydraUpdate_orig);
+        if(hydraDraw) aml->Hook((void*)hydraDraw, (void*)HydraDraw_hook, (void**)&HydraDraw_orig);
     }
-    if (C.hookKill && C.killRefill > 0.0f) { if (Sig(aKC, 0xfc1c0fe8)) aml->Hook((void*)aKC, (void*)HookOf_KillCalc, (void**)&KillCalc); else flog.Error("ComputeWillKillPed tidak cocok"); }
-    flog.Write("Hook terpasang. Tekan tombol hidrolik saat jalan kaki.");
+    else if(S.hydraButton) logger->Error("Tombol hidrolik di mode jalan TIDAK dipasang");
+
+    FLog("=== BulletTimeSA64 v1.10 dimulai ===");
+    if(S.hookTarget && aimTarget) aml->Hook((void*)aimTarget, (void*)Target_hook, (void**)&Target_orig);
+    if(S.hookAimEnter && aimEnter) aml->Hook((void*)aimEnter, (void*)EnterT_hook, (void**)&EnterT_orig);
+    if(S.hookAimExit && aimExit) aml->Hook((void*)aimExit, (void*)ExitT_hook, (void**)&ExitT_orig);
+
+    logger->Info("Siap v1.10 (hook: pemain=%d anim=%d hidrolik=%d, IFP=%d)",
+                 (int)(PlayerProcess_orig != NULL), (int)(AnimUpdate_orig != NULL), (int)(HydraUpdate_orig != NULL), (int)S.useIfp);
 }
